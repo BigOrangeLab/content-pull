@@ -7,7 +7,8 @@ import { createServer } from 'http';
 import { spawn } from 'child_process';
 import { URL } from 'url';
 import TurndownService from 'turndown';
-import { Document, Packer, Paragraph, HeadingLevel, TextRun } from 'docx';
+import { Document, Packer, Paragraph, HeadingLevel, TextRun, ExternalHyperlink } from 'docx';
+import { parse as parseHtml } from 'node-html-parser';
 
 const USER_AGENT = 'content-pull/1.0.0 (https://github.com/bigorangelab/content-pull)';
 const DEFAULT_DELAY_MS = 500;
@@ -168,31 +169,99 @@ async function doAuth(siteUrl) {
 
 // --- DOCX helpers ---
 
-function stripInlineMarkdown(text) {
-  return text
-    .replace(/\*\*(.+?)\*\*/g, '$1')
-    .replace(/\*(.+?)\*/g, '$1')
-    .replace(/_(.+?)_/g, '$1')
-    .replace(/\[(.+?)\]\(.+?\)/g, '$1')
-    .replace(/`(.+?)`/g, '$1');
-}
-
-function markdownToDocxParagraphs(md) {
-  const paragraphs = [];
-  for (const line of md.split('\n')) {
-    const t = line.trim();
-    if (!t || t === '---') continue;
-    if (t.startsWith('### ')) {
-      paragraphs.push(new Paragraph({ text: t.slice(4), heading: HeadingLevel.HEADING_3 }));
-    } else if (t.startsWith('## ')) {
-      paragraphs.push(new Paragraph({ text: t.slice(3), heading: HeadingLevel.HEADING_2 }));
-    } else if (t.startsWith('# ')) {
-      paragraphs.push(new Paragraph({ text: t.slice(2), heading: HeadingLevel.HEADING_1 }));
-    } else {
-      paragraphs.push(new Paragraph({ text: stripInlineMarkdown(t) }));
+function inlineRuns(node, fmt = {}) {
+  const runs = [];
+  for (const child of node.childNodes) {
+    if (child.nodeType === 3) {
+      const text = child.text.replace(/\s+/g, ' ');
+      if (text) runs.push(new TextRun({ text, ...fmt }));
+    } else if (child.nodeType === 1) {
+      const tag = child.tagName?.toLowerCase();
+      if (tag === 'strong' || tag === 'b') {
+        runs.push(...inlineRuns(child, { ...fmt, bold: true }));
+      } else if (tag === 'em' || tag === 'i') {
+        runs.push(...inlineRuns(child, { ...fmt, italics: true }));
+      } else if (tag === 'a') {
+        const href = child.getAttribute('href');
+        const inner = inlineRuns(child, fmt);
+        if (href && inner.length) {
+          runs.push(new ExternalHyperlink({ children: inner, link: href }));
+        } else {
+          runs.push(...inner);
+        }
+      } else if (tag === 'code') {
+        runs.push(...inlineRuns(child, { ...fmt, font: { name: 'Courier New' } }));
+      } else if (tag === 'br') {
+        runs.push(new TextRun({ text: '', break: 1 }));
+      } else {
+        runs.push(...inlineRuns(child, fmt));
+      }
     }
   }
-  return paragraphs;
+  return runs;
+}
+
+function htmlToDocxParagraphs(html) {
+  const root = parseHtml(html);
+  const paras = [];
+
+  function walk(node) {
+    if (node.nodeType !== 1) return;
+    const tag = node.tagName?.toLowerCase();
+    if (!tag) { node.childNodes.forEach(walk); return; }
+
+    const hm = tag.match(/^h([1-6])$/);
+    if (hm) {
+      const text = node.text.replace(/\s+/g, ' ').trim();
+      if (text) paras.push(new Paragraph({ text, heading: HeadingLevel[`HEADING_${hm[1]}`] }));
+      return;
+    }
+
+    switch (tag) {
+      case 'p': {
+        const runs = inlineRuns(node);
+        if (runs.length) paras.push(new Paragraph({ children: runs }));
+        break;
+      }
+      case 'li': {
+        const runs = inlineRuns(node);
+        if (runs.length) paras.push(new Paragraph({ children: [new TextRun('• '), ...runs] }));
+        break;
+      }
+      case 'pre': {
+        for (const line of node.text.split('\n'))
+          paras.push(new Paragraph({ children: [new TextRun({ text: line, font: { name: 'Courier New' }, size: 18 })] }));
+        break;
+      }
+      case 'table': {
+        for (const row of node.querySelectorAll('tr')) {
+          const cells = row.querySelectorAll('td, th');
+          const runs = [];
+          cells.forEach((cell, i) => {
+            if (i > 0) runs.push(new TextRun(' | '));
+            runs.push(...inlineRuns(cell));
+          });
+          if (runs.length) paras.push(new Paragraph({ children: runs }));
+        }
+        break;
+      }
+      case 'figcaption': {
+        const text = node.text.trim();
+        if (text) paras.push(new Paragraph({ children: [new TextRun({ text, size: 18, color: '666666' })] }));
+        break;
+      }
+      case 'hr':
+        paras.push(new Paragraph({ text: '' }));
+        break;
+      case 'script': case 'style': case 'noscript': case 'img': case 'figure':
+        break;
+      default:
+        node.childNodes.forEach(walk);
+    }
+  }
+
+  root.childNodes.forEach(walk);
+  return paras;
 }
 
 async function buildDocx(paragraphs) {
@@ -246,35 +315,75 @@ function writeItemMarkdown(item, td, dir) {
   utimesSync(filePath, mtime, mtime);
 }
 
-async function writeItemDocx(item, td, dir, typeSlug) {
+async function writeItemDocx(item, dir, typeSlug) {
   const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
-  const md = td.turndown(item.content?.rendered ?? '');
   const paragraphs = [
     metaParagraph(item, typeSlug),
     new Paragraph({ text: title, heading: HeadingLevel.HEADING_1 }),
-    ...markdownToDocxParagraphs(md),
+    ...htmlToDocxParagraphs(item.content?.rendered ?? ''),
   ];
   const buf = await buildDocx(paragraphs);
   writeFileSync(join(dir, `${item.slug}.docx`), buf);
+}
+
+function writeItemHtml(item, dir, typeSlug) {
+  const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+  const meta = JSON.stringify({ slug: item.slug, type: typeSlug, link: item.link, date: item.date, modified: item.modified });
+  const out = [
+    '<!DOCTYPE html>',
+    '<html lang="en">',
+    '<head>',
+    '  <meta charset="UTF-8">',
+    `  <title>${title}</title>`,
+    `  <meta name="date" content="${item.date}">`,
+    `  <meta name="modified" content="${item.modified}">`,
+    `  <link rel="canonical" href="${item.link}">`,
+    '</head>',
+    '<body>',
+    `<article data-content-pull-meta='${meta}'>`,
+    `<h1>${item.title?.rendered ?? title}</h1>`,
+    item.content?.rendered ?? '',
+    '</article>',
+    '</body>',
+    '</html>',
+  ].join('\n');
+  const filePath = join(dir, `${item.slug}.html`);
+  writeFileSync(filePath, out);
+  const mtime = new Date(item.modified);
+  utimesSync(filePath, mtime, mtime);
 }
 
 async function writeAggregate(allCollected, outputDir, format, td) {
   if (format === 'docx') {
     const paragraphs = [];
     let firstPost = true;
-    for (const { typeName, typeSlug, items } of allCollected) {
+    for (const { typeSlug, items } of allCollected) {
       for (const item of items) {
         const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
-        const md = td.turndown(item.content?.rendered ?? '');
         paragraphs.push(metaParagraph(item, typeSlug, !firstPost));
         paragraphs.push(new Paragraph({ text: title, heading: HeadingLevel.HEADING_1 }));
-        paragraphs.push(...markdownToDocxParagraphs(md));
+        paragraphs.push(...htmlToDocxParagraphs(item.content?.rendered ?? ''));
         firstPost = false;
       }
     }
     const buf = await buildDocx(paragraphs);
     writeFileSync(join(outputDir, 'content.docx'), buf);
     console.log(`Aggregate saved → ./content.docx`);
+  } else if (format === 'html') {
+    const parts = ['<!DOCTYPE html>', '<html lang="en">', '<head><meta charset="UTF-8"><title>Content Export</title></head>', '<body>'];
+    for (const { typeSlug, items } of allCollected) {
+      for (const item of items) {
+        const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+        const meta = JSON.stringify({ slug: item.slug, type: typeSlug, link: item.link, date: item.date, modified: item.modified });
+        parts.push(`<article data-content-pull-meta='${meta}'>`);
+        parts.push(`<h1>${item.title?.rendered ?? title}</h1>`);
+        parts.push(item.content?.rendered ?? '');
+        parts.push('</article>');
+      }
+    }
+    parts.push('</body>', '</html>');
+    writeFileSync(join(outputDir, 'content.html'), parts.join('\n'));
+    console.log('Aggregate saved → ./content.html');
   } else {
     const sections = [];
     for (const { typeName, items } of allCollected) {
@@ -291,7 +400,7 @@ async function writeAggregate(allCollected, outputDir, format, td) {
       }
     }
     writeFileSync(join(outputDir, 'content.md'), sections.join('\n\n---\n\n') + '\n');
-    console.log(`Aggregate saved → ./content.md`);
+    console.log('Aggregate saved → ./content.md');
   }
 }
 
@@ -380,7 +489,9 @@ async function doPull(siteUrl, opts) {
       mkdirSync(dir, { recursive: true });
       for (const item of items) {
         if (format === 'docx') {
-          await writeItemDocx(item, td, dir, type.slug);
+          await writeItemDocx(item, dir, type.slug);
+        } else if (format === 'html') {
+          writeItemHtml(item, dir, type.slug);
         } else {
           writeItemMarkdown(item, td, dir);
         }
@@ -406,7 +517,7 @@ Usage:
 Options:
   --output,    -o <dir>    Output directory (default: current directory)
   --types,     -t <list>   Comma-separated post types (default: all public)
-  --format,    -f <fmt>    Output format: md (default) or docx
+  --format,    -f <fmt>    Output format: md (default), html, or docx
   --aggregate, -a          Combine all posts into a single file
   --user,      -u <name>   WordPress username (overrides stored credentials)
   --pass,      -p <pass>   WordPress application password
