@@ -28,16 +28,50 @@ All logic lives in `index.js`. Key sections:
 
 - **Credential helpers** (`loadCredentials`, `saveCredentials`, `basicAuth`) — read/write `~/.content-pull/credentials.json`
 - **`doAuth(siteUrl)`** — Application Passwords OAuth-style flow: discovers the auth endpoint from `/wp-json/`, starts a local HTTP server, opens browser, captures callback
-- **`doPull(siteUrl, opts)`** — fetches post types, paginates through all posts, converts HTML to Markdown, writes files with correct timestamps
+- **WordPress.com API helpers** (`normalizeWpcomPost`, `getWpcomTypes`, `fetchAllWpcom`) — parallel to the `.org` fetch functions; normalize wpcom post shape to match `.org` shape so all serialisers are API-agnostic
+- **DOCX helpers** (`markdownToDocxParagraphs`, `buildDocx`, `metaParagraph`) — convert Markdown text to `docx` paragraph objects; `buildDocx` defines the `ContentPullMeta` custom paragraph style
+- **Serialisers** (`writeItemMarkdown`, `writeItemDocx`, `writeAggregate`) — write individual or combined output files in the requested format
+- **`doPull(siteUrl, opts)`** — detects which API to use, fetches post types, paginates through all posts, delegates to the appropriate serialiser
 - **CLI entry point** — simple manual arg parsing at the bottom, no commander/yargs
 
 ## WordPress REST API details
+
+### WordPress.org (self-hosted)
 
 - Post types: `GET /wp-json/wp/v2/types`
 - Posts per type: `GET /wp-json/wp/v2/{rest_base}?per_page=100&page=N&_fields=slug,date,modified,title,content,link`
 - Rendered content lives in `content.rendered` (default `context=view`) — shortcodes parsed, blocks rendered
 - Pagination via `X-WP-TotalPages` response header
 - Auth: HTTP Basic with WordPress Application Passwords (`username:app-password` base64-encoded)
+
+### WordPress.com
+
+- Base URL: `https://public-api.wordpress.com/rest/v1.1/sites/{hostname}/`
+- Post types: `GET .../post-types/` — filter to `api_queryable: true`
+- Posts per type: `GET .../posts/?type={slug}&status=publish&number=100&offset=N`
+- Pagination: offset-based; total post count returned as `found` in the response body
+- Auth: not required for public content
+- Post shape differs from `.org` — `title` is a plain string, `content` is a plain string, `URL` instead of `link`; `normalizeWpcomPost()` maps these to the `.org` shape
+
+### API detection
+
+`doPull` detects which API to use:
+1. Hostname ends with `.wordpress.com` → wpcom API directly
+2. Otherwise, tries `.org` API (`/wp-json/wp/v2/types`); if that throws, falls back to wpcom
+
+## DOCX output
+
+The `docx` package (v8) is used for Word document generation. Key design decisions:
+
+- **`ContentPullMeta` style** — a custom named paragraph style (`w:val="ContentPullMeta"`) defined in every generated DOCX. Each post begins with one such paragraph containing a JSON string: `{"slug":..., "type":..., "link":..., "date":..., "modified":...}`. This survives human editing and is the hook for round-trip parsing.
+- **Page breaks** — `pageBreakBefore: true` on the `ContentPullMeta` paragraph of every post except the first. This keeps the break attached to the start of the post rather than orphaned at the end of the previous one.
+- Inline Markdown formatting (bold, italic, links) is stripped to plain text — best-effort fidelity.
+
+## Dependencies
+
+- `docx` ^8.5.0 — Word document generation
+- `turndown` ^7.2.0 — HTML to Markdown conversion
+- Node 18+ built-ins: `fetch`, `fs`, `path`, `os`, `http`, `child_process`, `url`
 
 ## SKIP_TYPES
 
@@ -57,10 +91,6 @@ The delay is applied via a `sleep` helper before each request after the first, s
 
 All requests send `User-Agent: content-pull/1.0.0 (https://github.com/bigorangelab/content-pull)`. Update the `USER_AGENT` constant at the top of `index.js` when the version changes.
 
-## Dependencies
-
-- `turndown` ^7.2.0 — HTML to Markdown conversion
-- Node 18+ built-ins: `fetch`, `fs`, `path`, `os`, `http`, `child_process`, `url`
 
 ## Things to keep in mind
 

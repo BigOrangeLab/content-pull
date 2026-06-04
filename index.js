@@ -7,7 +7,7 @@ import { createServer } from 'http';
 import { spawn } from 'child_process';
 import { URL } from 'url';
 import TurndownService from 'turndown';
-import { Document, Packer, Paragraph, HeadingLevel, PageBreak } from 'docx';
+import { Document, Packer, Paragraph, HeadingLevel, TextRun } from 'docx';
 
 const USER_AGENT = 'content-pull/1.0.0 (https://github.com/bigorangelab/content-pull)';
 const DEFAULT_DELAY_MS = 500;
@@ -196,8 +196,34 @@ function markdownToDocxParagraphs(md) {
 }
 
 async function buildDocx(paragraphs) {
-  const doc = new Document({ sections: [{ children: paragraphs }] });
+  const doc = new Document({
+    styles: {
+      paragraphStyles: [{
+        id: 'ContentPullMeta',
+        name: 'ContentPull Meta',
+        basedOn: 'Normal',
+        run: { size: 16, color: '888888', font: { name: 'Courier New' } },
+        paragraph: { spacing: { after: 0 } },
+      }],
+    },
+    sections: [{ children: paragraphs }],
+  });
   return Packer.toBuffer(doc);
+}
+
+function metaParagraph(item, typeSlug, pageBreakBefore = false) {
+  const meta = JSON.stringify({
+    slug: item.slug,
+    type: typeSlug,
+    link: item.link,
+    date: item.date,
+    modified: item.modified,
+  });
+  return new Paragraph({
+    style: 'ContentPullMeta',
+    children: [new TextRun(meta)],
+    pageBreakBefore,
+  });
 }
 
 // --- Serialisers ---
@@ -220,12 +246,12 @@ function writeItemMarkdown(item, td, dir) {
   utimesSync(filePath, mtime, mtime);
 }
 
-async function writeItemDocx(item, td, dir) {
+async function writeItemDocx(item, td, dir, typeSlug) {
   const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
   const md = td.turndown(item.content?.rendered ?? '');
   const paragraphs = [
+    metaParagraph(item, typeSlug),
     new Paragraph({ text: title, heading: HeadingLevel.HEADING_1 }),
-    new Paragraph({ text: `${item.date} | ${item.link}` }),
     ...markdownToDocxParagraphs(md),
   ];
   const buf = await buildDocx(paragraphs);
@@ -235,15 +261,15 @@ async function writeItemDocx(item, td, dir) {
 async function writeAggregate(allCollected, outputDir, format, td) {
   if (format === 'docx') {
     const paragraphs = [];
-    for (const { typeName, items } of allCollected) {
-      paragraphs.push(new Paragraph({ text: typeName, heading: HeadingLevel.HEADING_1 }));
+    let firstPost = true;
+    for (const { typeName, typeSlug, items } of allCollected) {
       for (const item of items) {
         const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
         const md = td.turndown(item.content?.rendered ?? '');
-        paragraphs.push(new Paragraph({ text: title, heading: HeadingLevel.HEADING_2 }));
-        paragraphs.push(new Paragraph({ text: `${item.date} | ${item.link}` }));
+        paragraphs.push(metaParagraph(item, typeSlug, !firstPost));
+        paragraphs.push(new Paragraph({ text: title, heading: HeadingLevel.HEADING_1 }));
         paragraphs.push(...markdownToDocxParagraphs(md));
-        paragraphs.push(new Paragraph({ children: [new PageBreak()] }));
+        firstPost = false;
       }
     }
     const buf = await buildDocx(paragraphs);
@@ -354,7 +380,7 @@ async function doPull(siteUrl, opts) {
       mkdirSync(dir, { recursive: true });
       for (const item of items) {
         if (format === 'docx') {
-          await writeItemDocx(item, td, dir);
+          await writeItemDocx(item, td, dir, type.slug);
         } else {
           writeItemMarkdown(item, td, dir);
         }

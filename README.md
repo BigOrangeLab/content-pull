@@ -5,7 +5,7 @@ A CLI tool that pulls all public content from a WordPress site via the REST API 
 ## Requirements
 
 - Node.js 18 or later (for native `fetch`)
-- A WordPress site with the REST API enabled (default on all WordPress sites since 4.7)
+- A WordPress site with the REST API enabled (default on all WordPress sites since 4.7), or a WordPress.com-hosted site
 
 ## Installation
 
@@ -58,6 +58,8 @@ This fetches all publicly available post types — posts, pages, and any custom 
 |------|-------|-------------|
 | `--output <dir>` | `-o` | Directory to write files into (default: current directory) |
 | `--types <list>` | `-t` | Comma-separated post type slugs to pull (default: all public types) |
+| `--format <fmt>` | `-f` | Output format: `md` (default) or `docx` |
+| `--aggregate` | `-a` | Combine all posts into a single file (`content.md` or `content.docx`) |
 | `--user <name>` | `-u` | WordPress username (overrides stored credentials) |
 | `--pass <pass>` | `-p` | WordPress application password (overrides stored credentials) |
 | `--delay <ms>` | `-d` | Milliseconds to wait between requests (default: `500`) |
@@ -65,14 +67,20 @@ This fetches all publicly available post types — posts, pages, and any custom 
 ### Examples
 
 ```bash
-# Pull everything into the current directory
-node index.js https://example.com
-
-# Pull into a specific output directory
+# Pull everything as Markdown (default)
 node index.js https://example.com --output ./site-backup
 
 # Pull only posts and pages
 node index.js https://example.com --types post,page
+
+# Pull as a single aggregated Markdown file
+node index.js https://example.com --aggregate --output ./out
+
+# Pull as individual Word documents
+node index.js https://example.com --format docx --output ./out
+
+# Pull as a single Word document (useful for editorial review)
+node index.js https://example.com --format docx --aggregate --output ./out
 
 # Pull with explicit credentials
 node index.js https://example.com --user george --pass abcd-efgh-ijkl-mnop
@@ -128,6 +136,8 @@ Credentials are stored in `~/.content-pull/credentials.json`, keyed by site URL.
 
 ## Output format
 
+### Markdown (default)
+
 Each file is saved as `<post-type>/<slug>.md` with YAML frontmatter:
 
 ```markdown
@@ -147,6 +157,64 @@ Paragraph text, **bold**, _italic_, [links](https://example.com), etc.
 
 File modification times (`mtime`) are set to match the post's `modified` date from WordPress, so the filesystem timestamps reflect when content was last updated on the site.
 
+With `--aggregate`, a single `content.md` is written to the output directory. Posts are separated by `---` rules and each opens with `## <title>` and a metadata line.
+
+### Word documents (`--format docx`)
+
+Each post is saved as `<post-type>/<slug>.docx` (or a single `content.docx` with `--aggregate`). Headings and paragraph structure are preserved; inline formatting (bold, italic, links) is converted to plain text.
+
+Each post begins with a `ContentPullMeta` paragraph — a small grey monospaced line containing a JSON object that identifies the post:
+
+```json
+{"slug":"hello-world","type":"post","link":"https://example.com/hello-world/","date":"2024-01-15T09:30:00","modified":"2024-06-01T14:22:00"}
+```
+
+In an aggregate DOCX, every post (except the first) starts on a new page. The `ContentPullMeta` line is the machine-readable delimiter that marks the beginning of each post's content and is preserved even after a human edits the document.
+
+## Round-trip editing
+
+The DOCX format supports an editorial workflow: pull content, edit the Word document, then parse the changes back out to push upstream to WordPress.
+
+### How delimiters work
+
+The `ContentPullMeta` paragraph style is stored in the DOCX XML as:
+
+```xml
+<w:pStyle w:val="ContentPullMeta"/>
+```
+
+To parse edited content back out:
+
+1. Unzip the `.docx` file (it is a ZIP archive).
+2. Read `word/document.xml`.
+3. Find every `<w:p>` element whose `<w:pPr>` contains `<w:pStyle w:val="ContentPullMeta"/>`.
+4. The text of that paragraph is the JSON metadata for the post that follows it.
+5. Collect all subsequent paragraphs (as text or HTML) until the next `ContentPullMeta` paragraph — that is the edited content for that post.
+6. Use the `slug`, `type`, and `link` fields from the JSON to identify the WordPress post to update via the REST API.
+
+### Minimal Node.js parse example
+
+```js
+import { readFileSync } from 'fs';
+import { unzipSync } from 'zlib'; // or use a zip library
+// Parse word/document.xml from the docx ZIP, then:
+
+const posts = [];
+let current = null;
+
+for (const para of paragraphs) {
+  if (para.style === 'ContentPullMeta') {
+    if (current) posts.push(current);
+    current = { meta: JSON.parse(para.text), lines: [] };
+  } else if (current) {
+    current.lines.push(para.text);
+  }
+}
+if (current) posts.push(current);
+// posts[n].meta.slug  → WordPress post slug
+// posts[n].lines      → edited content paragraphs
+```
+
 ## Post types
 
 By default, all post types registered with the REST API are pulled, except for WordPress-internal types that don't represent user content:
@@ -165,13 +233,20 @@ To pull only specific types, use `--types`:
 node index.js https://example.com --types post,page,event
 ```
 
+## WordPress.com sites
+
+Sites hosted on WordPress.com (`*.wordpress.com` or custom domains on the WordPress.com platform) are supported automatically. For `*.wordpress.com` hostnames the tool uses the WordPress.com REST API (`public-api.wordpress.com`) directly. For self-hosted sites, it tries the standard WordPress REST API first and falls back to the WordPress.com API if the REST API is unavailable (e.g. disabled by a security plugin, or the site is behind Jetpack).
+
+WordPress.com public content requires no authentication.
+
 ## How it works
 
-1. Fetches `/wp-json/wp/v2/types` to discover all post types registered with the REST API
-2. For each post type, paginates through all posts using `?per_page=100` with the `X-WP-TotalPages` header
-3. Requests `content.rendered` — the server-side rendered HTML, with all shortcodes, blocks, and dynamic content resolved
-4. Converts the HTML to Markdown using [Turndown](https://github.com/mixmark-io/turndown)
-5. Writes each post as `<type>/<slug>.md` with YAML frontmatter and sets the file `mtime` to the post's last modified date
+1. Detects which API to use: `.wordpress.com` hostnames use the WordPress.com REST API; all others try the WordPress REST API (`/wp-json/wp/v2/`) and fall back to WordPress.com if that fails
+2. Fetches the list of post types and filters out WordPress-internal types
+3. For each post type, paginates through all published posts (100 per page)
+4. Requests rendered HTML content — shortcodes, blocks, and dynamic content are fully resolved
+5. Converts the HTML to Markdown using [Turndown](https://github.com/mixmark-io/turndown), or builds Word document paragraphs for `--format docx`
+6. Writes output files and sets each file's `mtime` to the post's last modified date
 
 ## License
 
