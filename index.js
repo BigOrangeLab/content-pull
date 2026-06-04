@@ -7,6 +7,7 @@ import { createServer } from 'http';
 import { spawn } from 'child_process';
 import { URL } from 'url';
 import TurndownService from 'turndown';
+import { Document, Packer, Paragraph, HeadingLevel, PageBreak } from 'docx';
 
 const USER_AGENT = 'content-pull/1.0.0 (https://github.com/bigorangelab/content-pull)';
 const DEFAULT_DELAY_MS = 500;
@@ -127,12 +128,117 @@ async function doAuth(siteUrl) {
   });
 }
 
+// --- DOCX helpers ---
+
+function stripInlineMarkdown(text) {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/\*(.+?)\*/g, '$1')
+    .replace(/_(.+?)_/g, '$1')
+    .replace(/\[(.+?)\]\(.+?\)/g, '$1')
+    .replace(/`(.+?)`/g, '$1');
+}
+
+function markdownToDocxParagraphs(md) {
+  const paragraphs = [];
+  for (const line of md.split('\n')) {
+    const t = line.trim();
+    if (!t || t === '---') continue;
+    if (t.startsWith('### ')) {
+      paragraphs.push(new Paragraph({ text: t.slice(4), heading: HeadingLevel.HEADING_3 }));
+    } else if (t.startsWith('## ')) {
+      paragraphs.push(new Paragraph({ text: t.slice(3), heading: HeadingLevel.HEADING_2 }));
+    } else if (t.startsWith('# ')) {
+      paragraphs.push(new Paragraph({ text: t.slice(2), heading: HeadingLevel.HEADING_1 }));
+    } else {
+      paragraphs.push(new Paragraph({ text: stripInlineMarkdown(t) }));
+    }
+  }
+  return paragraphs;
+}
+
+async function buildDocx(paragraphs) {
+  const doc = new Document({ sections: [{ children: paragraphs }] });
+  return Packer.toBuffer(doc);
+}
+
+// --- Serialisers ---
+
+function writeItemMarkdown(item, td, dir) {
+  const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+  const md = td.turndown(item.content?.rendered ?? '');
+  const frontmatter = [
+    '---',
+    `title: ${JSON.stringify(title)}`,
+    `date: ${item.date}`,
+    `modified: ${item.modified}`,
+    `link: ${item.link}`,
+    '---',
+    '',
+  ].join('\n');
+  const filePath = join(dir, `${item.slug}.md`);
+  writeFileSync(filePath, `${frontmatter}\n${md}\n`);
+  const mtime = new Date(item.modified);
+  utimesSync(filePath, mtime, mtime);
+}
+
+async function writeItemDocx(item, td, dir) {
+  const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+  const md = td.turndown(item.content?.rendered ?? '');
+  const paragraphs = [
+    new Paragraph({ text: title, heading: HeadingLevel.HEADING_1 }),
+    new Paragraph({ text: `${item.date} | ${item.link}` }),
+    ...markdownToDocxParagraphs(md),
+  ];
+  const buf = await buildDocx(paragraphs);
+  writeFileSync(join(dir, `${item.slug}.docx`), buf);
+}
+
+async function writeAggregate(allCollected, outputDir, format, td) {
+  if (format === 'docx') {
+    const paragraphs = [];
+    for (const { typeName, items } of allCollected) {
+      paragraphs.push(new Paragraph({ text: typeName, heading: HeadingLevel.HEADING_1 }));
+      for (const item of items) {
+        const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+        const md = td.turndown(item.content?.rendered ?? '');
+        paragraphs.push(new Paragraph({ text: title, heading: HeadingLevel.HEADING_2 }));
+        paragraphs.push(new Paragraph({ text: `${item.date} | ${item.link}` }));
+        paragraphs.push(...markdownToDocxParagraphs(md));
+        paragraphs.push(new Paragraph({ children: [new PageBreak()] }));
+      }
+    }
+    const buf = await buildDocx(paragraphs);
+    writeFileSync(join(outputDir, 'content.docx'), buf);
+    console.log(`Aggregate saved → ./content.docx`);
+  } else {
+    const sections = [];
+    for (const { typeName, items } of allCollected) {
+      sections.push(`# ${typeName}\n`);
+      for (const item of items) {
+        const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+        const md = td.turndown(item.content?.rendered ?? '');
+        sections.push([
+          `## ${title}`,
+          `date: ${item.date} | modified: ${item.modified} | link: ${item.link}`,
+          '',
+          md,
+        ].join('\n'));
+      }
+    }
+    writeFileSync(join(outputDir, 'content.md'), sections.join('\n\n---\n\n') + '\n');
+    console.log(`Aggregate saved → ./content.md`);
+  }
+}
+
 // --- Pull subcommand ---
 
 async function doPull(siteUrl, opts) {
   const baseUrl = siteUrl.replace(/\/$/, '');
   const apiBase = `${baseUrl}/wp-json/wp/v2`;
   const outputDir = resolve(opts.output);
+  const format = opts.format ?? 'md';
+  const aggregate = opts.aggregate ?? false;
 
   let authHeader = null;
   if (opts.user && opts.pass) {
@@ -158,12 +264,16 @@ async function doPull(siteUrl, opts) {
   }
 
   const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
-
   const delay = opts.delay ?? DEFAULT_DELAY_MS;
 
   console.log(`Pulling from: ${baseUrl}`);
   console.log(`Post types:   ${postTypes.map(t => t.slug).join(', ')}`);
+  console.log(`Output format: ${format}${aggregate ? ' (aggregate)' : ''}`);
   console.log(`Request delay: ${delay}ms\n`);
+
+  mkdirSync(outputDir, { recursive: true });
+
+  const allCollected = [];
 
   for (let i = 0; i < postTypes.length; i++) {
     if (i > 0) await sleep(delay);
@@ -182,31 +292,25 @@ async function doPull(siteUrl, opts) {
       continue;
     }
 
-    const dir = join(outputDir, type.slug);
-    mkdirSync(dir, { recursive: true });
-
-    for (const item of items) {
-      const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
-      const md = td.turndown(item.content?.rendered ?? '');
-
-      const frontmatter = [
-        '---',
-        `title: ${JSON.stringify(title)}`,
-        `date: ${item.date}`,
-        `modified: ${item.modified}`,
-        `link: ${item.link}`,
-        '---',
-        '',
-      ].join('\n');
-
-      const filePath = join(dir, `${item.slug}.md`);
-      writeFileSync(filePath, `${frontmatter}\n${md}\n`);
-
-      const mtime = new Date(item.modified);
-      utimesSync(filePath, mtime, mtime);
+    if (aggregate) {
+      allCollected.push({ typeName: type.name, typeSlug: type.slug, items });
+      console.log(`${items.length} collected`);
+    } else {
+      const dir = join(outputDir, type.slug);
+      mkdirSync(dir, { recursive: true });
+      for (const item of items) {
+        if (format === 'docx') {
+          await writeItemDocx(item, td, dir);
+        } else {
+          writeItemMarkdown(item, td, dir);
+        }
+      }
+      console.log(`${items.length} saved → ./${type.slug}/`);
     }
+  }
 
-    console.log(`${items.length} saved → ./${type.slug}/`);
+  if (aggregate && allCollected.length > 0) {
+    await writeAggregate(allCollected, outputDir, format, td);
   }
 
   console.log('\nDone.');
@@ -220,24 +324,28 @@ Usage:
   content-pull auth <url>         Authenticate via Application Passwords
 
 Options:
-  --output, -o <dir>    Output directory (default: current directory)
-  --types,  -t <list>   Comma-separated post types (default: all public)
-  --user,   -u <name>   WordPress username (overrides stored credentials)
-  --pass,   -p <pass>   WordPress application password
-  --delay,  -d <ms>     Milliseconds to wait between requests (default: ${DEFAULT_DELAY_MS})
+  --output,    -o <dir>    Output directory (default: current directory)
+  --types,     -t <list>   Comma-separated post types (default: all public)
+  --format,    -f <fmt>    Output format: md (default) or docx
+  --aggregate, -a          Combine all posts into a single file
+  --user,      -u <name>   WordPress username (overrides stored credentials)
+  --pass,      -p <pass>   WordPress application password
+  --delay,     -d <ms>     Milliseconds to wait between requests (default: ${DEFAULT_DELAY_MS})
 `.trim();
 
 const args = process.argv.slice(2);
-const opts = { output: '.', types: null, user: null, pass: null, delay: null };
+const opts = { output: '.', types: null, format: 'md', aggregate: false, user: null, pass: null, delay: null };
 const positional = [];
 
 for (let i = 0; i < args.length; i++) {
   switch (args[i]) {
-    case '--output': case '-o': opts.output = args[++i]; break;
-    case '--types':  case '-t': opts.types = args[++i].split(',').map(s => s.trim()); break;
-    case '--user':   case '-u': opts.user = args[++i]; break;
-    case '--pass':   case '-p': opts.pass = args[++i]; break;
-    case '--delay':  case '-d': opts.delay = parseInt(args[++i], 10); break;
+    case '--output':    case '-o': opts.output = args[++i]; break;
+    case '--types':     case '-t': opts.types = args[++i].split(',').map(s => s.trim()); break;
+    case '--format':    case '-f': opts.format = args[++i]; break;
+    case '--aggregate': case '-a': opts.aggregate = true; break;
+    case '--user':      case '-u': opts.user = args[++i]; break;
+    case '--pass':      case '-p': opts.pass = args[++i]; break;
+    case '--delay':     case '-d': opts.delay = parseInt(args[++i], 10); break;
     default:
       if (!args[i].startsWith('-')) positional.push(args[i]);
   }

@@ -10,6 +10,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "docx": "^8.5.0",
     "turndown": "^7.2.0"
   },
   "license": "GPL-2.0-or-later"
