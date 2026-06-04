@@ -1,3 +1,10 @@
+<div align="center"><table width="60%"><tr>
+<td width="70"><a href="https://www.bigorangelab.com/"><img src="https://avatars.githubusercontent.com/u/18298036?s=200&v=4" width="50" alt="Big Orange Lab"></a></td>
+<td valign="middle"><strong><a href="https://www.bigorangelab.com/">Big Orange Lab</a></strong> is a full-service digital agency specialising in WordPress and HubSpot website design, development, branding, and UX for B2B organisations.</td>
+</tr></table></div>
+
+---
+
 # WordPress Content Pull
 
 A CLI tool that pulls all public content from a WordPress site via the REST API and saves it as Markdown files. Content is fetched in its fully rendered form — shortcodes are parsed, blocks are rendered — not as raw block markup.
