@@ -7,7 +7,9 @@ import { createServer } from 'http';
 import { spawn } from 'child_process';
 import { URL } from 'url';
 import TurndownService from 'turndown';
+import Anthropic from '@anthropic-ai/sdk';
 import { Document, Packer, Paragraph, HeadingLevel, TextRun, ExternalHyperlink } from 'docx';
+import JSZip from 'jszip';
 import { parse as parseHtml } from 'node-html-parser';
 
 const USER_AGENT = 'content-pull/1.0.0 (https://github.com/bigorangelab/content-pull)';
@@ -55,10 +57,11 @@ function openBrowser(url) {
   spawn(cmd, [url], { detached: true, stdio: 'ignore' }).unref();
 }
 
-async function apiFetch(url, authHeader) {
+async function apiFetch(url, authHeader, method = 'GET', data = null) {
   const headers = { Accept: 'application/json', 'User-Agent': USER_AGENT };
   if (authHeader) headers.Authorization = authHeader;
-  const res = await fetch(url, { headers });
+  if (data) headers['Content-Type'] = 'application/json';
+  const res = await fetch(url, { method, headers, body: data ? JSON.stringify(data) : undefined });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${url}`);
   return { body: await res.json(), headers: res.headers };
 }
@@ -116,6 +119,167 @@ async function fetchAllWpcom(siteId, typeSlug, delay) {
     if (offset >= (body.found ?? 0)) break;
   }
   return items;
+}
+
+// --- Reimport helpers ---
+
+function normText(t) {
+  return t.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function decodeXmlEntities(s) {
+  return s
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+}
+
+function parseDocxXml(xml) {
+  const paras = [];
+  for (const [pXml] of xml.matchAll(/<w:p[ >][\s\S]*?<\/w:p>/g)) {
+    const styleMatch = pXml.match(/<w:pStyle w:val="([^"]+)"/);
+    const texts = [];
+    for (const [, t] of pXml.matchAll(/<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g))
+      texts.push(decodeXmlEntities(t));
+    paras.push({ style: styleMatch?.[1] ?? null, text: texts.join('') });
+  }
+  return paras;
+}
+
+async function loadDocxPosts(filePath) {
+  const zip = await JSZip.loadAsync(readFileSync(filePath));
+  const xml = await zip.file('word/document.xml').async('string');
+  const paras = parseDocxXml(xml);
+  const posts = [];
+  let current = null;
+  for (const { style, text } of paras) {
+    if (style === 'ContentPullMeta') {
+      if (current) posts.push(current);
+      try { current = { meta: JSON.parse(text), paragraphs: [] }; } catch { current = null; }
+    } else if (current && text.trim()) {
+      current.paragraphs.push(text.trim());
+    }
+  }
+  if (current) posts.push(current);
+  return posts;
+}
+
+function diffParagraphs(orig, edit) {
+  const n = orig.length, m = edit.length;
+  const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = 1; i <= n; i++)
+    for (let j = 1; j <= m; j++)
+      dp[i][j] = normText(orig[i - 1]) === normText(edit[j - 1])
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+  const ops = [];
+  let i = n, j = m;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && normText(orig[i - 1]) === normText(edit[j - 1])) {
+      ops.push({ type: 'equal', orig: orig[i - 1], edit: edit[j - 1] }); i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      ops.push({ type: 'added', edit: edit[j - 1] }); j--;
+    } else {
+      ops.push({ type: 'removed', orig: orig[i - 1] }); i--;
+    }
+  }
+  ops.reverse();
+  const result = [];
+  for (let k = 0; k < ops.length; k++) {
+    if (ops[k].type === 'removed' && ops[k + 1]?.type === 'added') {
+      result.push({ type: 'changed', orig: ops[k].orig, edit: ops[k + 1].edit }); k++;
+    } else {
+      result.push(ops[k]);
+    }
+  }
+  return result;
+}
+
+function parseWpBlocks(raw) {
+  const blocks = [];
+  for (const open of raw.matchAll(/<!-- wp:([\w/-]+)(?:\s+({[\s\S]*?}))?\s*-->/g)) {
+    const name = open[1];
+    const closeTag = `<!-- /wp:${name} -->`;
+    const contentStart = open.index + open[0].length;
+    const closePos = raw.indexOf(closeTag, contentStart);
+    if (closePos === -1) continue;
+    const innerHTML = raw.slice(contentStart, closePos);
+    if (innerHTML.includes('<!-- wp:')) continue;
+    blocks.push({
+      name,
+      innerHTML,
+      innerText: stripTags(innerHTML),
+      start: open.index,
+      end: closePos + closeTag.length,
+      raw: raw.slice(open.index, closePos + closeTag.length),
+    });
+  }
+  return blocks;
+}
+
+function spliceBlockText(block, newText) {
+  const m = block.innerHTML.match(/^(\s*<([\w]+)([^>]*)>)([\s\S]*?)(<\/\2>\s*)$/);
+  if (!m) return null;
+  const [, open, , , , close] = m;
+  const newInner = `${open}${newText}${close}`;
+  const innerStart = block.raw.indexOf(block.innerHTML);
+  if (innerStart === -1) return null;
+  return block.raw.slice(0, innerStart) + newInner + block.raw.slice(innerStart + block.innerHTML.length);
+}
+
+async function llmMerge(anthropic, change, blockRaw, fullRaw) {
+  // Returns { updatedRaw: string, confidence: number, reasoning: string }
+  // blockRaw is the specific block if we found one; fullRaw is the entire post content
+  const context = blockRaw
+    ? `BLOCK TO UPDATE:\n\`\`\`\n${blockRaw}\n\`\`\``
+    : `FULL POST BLOCK CONTENT (find and update the right block):\n\`\`\`\n${fullRaw}\n\`\`\``;
+
+  const actionDesc = change.type === 'changed'
+    ? `Change this text:\n  FROM: ${change.orig}\n  TO:   ${change.edit}`
+    : change.type === 'added'
+    ? `Insert this new paragraph at the appropriate position:\n  "${change.edit}"`
+    : `Remove the block containing this text:\n  "${change.orig}"`;
+
+  const prompt = `You are a WordPress content migration assistant. Apply an editorial change back to WordPress block markup.
+
+${actionDesc}
+
+${context}
+
+Rules:
+- Preserve all block attributes (the JSON in <!-- wp:name {...} -->), CSS classes, and HTML structure
+- For a text change, only update the text; preserve inline formatting (bold, italic, links) where it still applies
+- For an addition, generate a new wp:paragraph block and insert it in the right place
+- For a deletion, remove the entire block containing that text
+- Return ${blockRaw ? 'the updated block' : 'the full updated post content'}
+
+Respond using the merge_result tool.`;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 2048,
+      tools: [{
+        name: 'merge_result',
+        description: 'The result of applying the editorial change',
+        input_schema: {
+          type: 'object',
+          properties: {
+            updated: { type: 'string', description: 'The updated block or full post content' },
+            confidence: { type: 'integer', description: 'Confidence 0–100 that this is correct' },
+            reasoning: { type: 'string', description: 'Brief explanation of what was changed and any concerns' },
+          },
+          required: ['updated', 'confidence', 'reasoning'],
+        },
+      }],
+      tool_choice: { type: 'tool', name: 'merge_result' },
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const toolUse = response.content.find(b => b.type === 'tool_use');
+    if (!toolUse) throw new Error('No tool_use block in response');
+    return toolUse.input;
+  } catch (e) {
+    return { updated: blockRaw ?? fullRaw, confidence: 0, reasoning: `LLM call failed: ${e.message}` };
+  }
 }
 
 // --- Auth subcommand ---
@@ -404,6 +568,191 @@ async function writeAggregate(allCollected, outputDir, format, td) {
   }
 }
 
+// --- Reimport subcommand ---
+
+async function doReimport(siteUrl, origPath, editedPath, opts) {
+  const dryRun = opts.dryRun ?? false;
+  const baseUrl = siteUrl.replace(/\/$/, '');
+  const apiBase = `${baseUrl}/wp-json/wp/v2`;
+
+  let authHeader = null;
+  if (opts.user && opts.pass) {
+    authHeader = basicAuth(opts.user, opts.pass);
+  } else {
+    const stored = loadCredentials(siteUrl);
+    if (stored) authHeader = basicAuth(stored.user, stored.pass);
+  }
+  if (!authHeader) {
+    console.error('Authentication required for reimport.\nStore credentials first: content-pull auth ' + baseUrl);
+    process.exit(1);
+  }
+
+  const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
+  if (!anthropic) console.log('Note: ANTHROPIC_API_KEY not set — unmatched changes will be written to review file only.\n');
+
+  process.stdout.write('Parsing original DOCX... ');
+  const origPosts = await loadDocxPosts(origPath);
+  console.log(`${origPosts.length} post(s)`);
+
+  process.stdout.write('Parsing edited DOCX...   ');
+  const editPosts = await loadDocxPosts(editedPath);
+  console.log(`${editPosts.length} post(s)`);
+
+  if (!origPosts.length || !editPosts.length) {
+    console.error('No ContentPullMeta markers found — was this DOCX generated by content-pull?');
+    process.exit(1);
+  }
+
+  const origMap = new Map(origPosts.map(p => [p.meta.slug, p]));
+  const editMap = new Map(editPosts.map(p => [p.meta.slug, p]));
+  const toProcess = [...editMap.keys()].filter(s => origMap.has(s));
+  const newSlugs = [...editMap.keys()].filter(s => !origMap.has(s));
+  const goneSlugs = [...origMap.keys()].filter(s => !editMap.has(s));
+  if (newSlugs.length) console.log(`Note: ${newSlugs.length} post(s) not in original, skipped: ${newSlugs.join(', ')}`);
+  if (goneSlugs.length) console.log(`Note: ${goneSlugs.length} post(s) removed from edited, skipped: ${goneSlugs.join(', ')}`);
+
+  // Fetch WP post types once to resolve rest_base
+  let typeRestBases = {};
+  try {
+    const { body: types } = await apiFetch(`${apiBase}/types`, authHeader);
+    typeRestBases = Object.fromEntries(Object.values(types).map(t => [t.slug, t.rest_base]));
+  } catch { /* fallback to slug+s below */ }
+
+  let changedCount = 0;
+  const allReviewItems = {}; // slug → [{...}]
+
+  for (const slug of toProcess) {
+    const orig = origMap.get(slug);
+    const edit = editMap.get(slug);
+    const diff = diffParagraphs(orig.paragraphs, edit.paragraphs);
+    const changes = diff.filter(d => d.type !== 'equal');
+    if (!changes.length) continue;
+
+    changedCount++;
+    const typeSlug = orig.meta.type;
+    console.log(`\n${slug} (${typeSlug}): ${changes.length} change(s)`);
+    changes.forEach(c => {
+      if (c.type === 'changed') console.log(`  ~ "${c.orig.slice(0, 72)}" → "${c.edit.slice(0, 72)}"`);
+      else if (c.type === 'added') console.log(`  + "${c.edit.slice(0, 72)}"`);
+      else console.log(`  - "${c.orig.slice(0, 72)}"`);
+    });
+
+    if (dryRun) continue;
+
+    // Fetch raw block content from WordPress
+    const restBase = typeRestBases[typeSlug] ?? `${typeSlug}s`;
+    let postData;
+    try {
+      const { body } = await apiFetch(`${apiBase}/${restBase}?slug=${slug}&context=edit&_fields=id,content`, authHeader);
+      postData = Array.isArray(body) ? body[0] : null;
+    } catch (e) { console.log(`  ERROR fetching: ${e.message}`); continue; }
+    if (!postData?.id) { console.log('  ERROR: post not found or insufficient permissions'); continue; }
+    const rawContent = postData.content?.raw;
+    if (!rawContent) { console.log('  ERROR: no raw content (check auth and context=edit support)'); continue; }
+
+    const blocks = parseWpBlocks(rawContent);
+    const reviewItems = [];
+
+    // Collect replacements; apply back-to-front to preserve offsets
+    const replacements = []; // [{start, end, newBlockRaw}]
+
+    for (const change of changes) {
+      // --- Programmatic path for 'changed' ---
+      if (change.type === 'changed') {
+        const matchBlock = blocks.find(b => normText(b.innerText) === normText(change.orig));
+        if (matchBlock) {
+          const hasInlineHtml = /<\w/.test(matchBlock.innerHTML.replace(/<[\w]+[^>]*>|<\/[\w]+>/g, ''));
+          const spliced = spliceBlockText(matchBlock, change.edit);
+          if (spliced && !hasInlineHtml) {
+            replacements.push({ start: matchBlock.start, end: matchBlock.end, newBlockRaw: spliced });
+            continue;
+          }
+          // Block found but has rich inline HTML — let LLM preserve formatting
+          if (anthropic) {
+            const result = await llmMerge(anthropic, change, matchBlock.raw, null);
+            if (result.confidence >= 90) {
+              replacements.push({ start: matchBlock.start, end: matchBlock.end, newBlockRaw: result.updated });
+              console.log(`  ✓ LLM merged inline-rich block (${result.confidence}%)`);
+            } else {
+              reviewItems.push({ change_type: 'changed', reason: 'low_confidence', ...change, block_raw: matchBlock.raw, llm_suggestion: result.updated, confidence: result.confidence, reasoning: result.reasoning });
+              console.log(`  ⚠ LLM confidence ${result.confidence}% — flagged for review`);
+            }
+            continue;
+          }
+          // No LLM — use simple splice anyway, note formatting loss
+          if (spliced) {
+            replacements.push({ start: matchBlock.start, end: matchBlock.end, newBlockRaw: spliced });
+            console.log(`  ~ Applied (inline formatting may be lost)`);
+          } else {
+            reviewItems.push({ change_type: 'changed', reason: 'no_llm_complex_block', ...change, block_raw: matchBlock.raw });
+          }
+          continue;
+        }
+      }
+
+      // --- LLM path: no block match, addition, or deletion ---
+      if (anthropic) {
+        const result = await llmMerge(anthropic, change, null, rawContent);
+        if (result.confidence >= 90) {
+          // LLM returned updated full content; we'll apply it as a whole-content replace
+          replacements.push({ fullReplace: result.updated });
+          console.log(`  ✓ LLM applied ${change.type} (${result.confidence}%)`);
+        } else {
+          reviewItems.push({ change_type: change.type, reason: 'low_confidence', ...change, llm_suggestion: result.updated, confidence: result.confidence, reasoning: result.reasoning });
+          console.log(`  ⚠ LLM confidence ${result.confidence}% — flagged for review`);
+        }
+      } else {
+        const label = change.type === 'added' ? `+ "${change.edit.slice(0, 60)}"` : `- "${change.orig.slice(0, 60)}"`;
+        console.log(`  WARN no match for ${label} — flagged for review (no ANTHROPIC_API_KEY)`);
+        reviewItems.push({ change_type: change.type, reason: 'no_match', ...change });
+      }
+    }
+
+    if (reviewItems.length) {
+      allReviewItems[slug] = { meta: orig.meta, items: reviewItems };
+    }
+
+    if (!replacements.length) { console.log('  No changes applied.'); continue; }
+
+    // Build updated content — handle full-content replace from LLM
+    const fullReplace = replacements.find(r => r.fullReplace);
+    let updatedRaw;
+    if (fullReplace) {
+      updatedRaw = fullReplace.fullReplace;
+    } else {
+      replacements.sort((a, b) => b.start - a.start);
+      updatedRaw = rawContent;
+      for (const { start, end, newBlockRaw } of replacements) {
+        updatedRaw = updatedRaw.slice(0, start) + newBlockRaw + updatedRaw.slice(end);
+      }
+    }
+
+    try {
+      await apiFetch(`${apiBase}/${restBase}/${postData.id}`, authHeader, 'POST', { content: updatedRaw });
+      const skipped = changes.length - replacements.length;
+      console.log(`  ✓ Pushed ${replacements.length} change(s)${skipped ? `, ${skipped} flagged` : ''}`);
+    } catch (e) {
+      console.log(`  ERROR pushing: ${e.message}`);
+    }
+  }
+
+  // Write review file
+  if (Object.keys(allReviewItems).length) {
+    const reviewPath = resolve('reimport-review.json');
+    writeFileSync(reviewPath, JSON.stringify(allReviewItems, null, 2));
+    console.log(`\nReview file written: ${reviewPath}`);
+    console.log('Items flagged for human or agent review. Pass this file to an LLM with access to the WordPress REST API to resolve remaining changes.');
+  }
+
+  if (!changedCount) {
+    console.log('\nNo changes detected.');
+  } else if (dryRun) {
+    console.log(`\nDry run — ${changedCount} post(s) have changes. Remove --dry-run to apply.`);
+  } else {
+    console.log('\nDone.');
+  }
+}
+
 // --- Pull subcommand ---
 
 async function doPull(siteUrl, opts) {
@@ -511,10 +860,11 @@ async function doPull(siteUrl, opts) {
 
 const USAGE = `
 Usage:
-  content-pull <url> [options]    Pull content from a WordPress site
-  content-pull auth <url>         Authenticate via Application Passwords
+  content-pull <url> [options]                              Pull content from a WordPress site
+  content-pull auth <url>                                   Authenticate via Application Passwords
+  content-pull reimport <url> <original.docx> <edited.docx> Reimport edited DOCX back to WordPress
 
-Options:
+Pull options:
   --output,    -o <dir>    Output directory (default: current directory)
   --types,     -t <list>   Comma-separated post types (default: all public)
   --format,    -f <fmt>    Output format: md (default), html, or docx
@@ -522,10 +872,18 @@ Options:
   --user,      -u <name>   WordPress username (overrides stored credentials)
   --pass,      -p <pass>   WordPress application password
   --delay,     -d <ms>     Milliseconds to wait between requests (default: ${DEFAULT_DELAY_MS})
+
+Reimport options:
+  --dry-run,   -n          Show what would change without applying
+  --user,      -u <name>   WordPress username (required)
+  --pass,      -p <pass>   WordPress application password (required)
+
+  Set ANTHROPIC_API_KEY to enable LLM-assisted merging of complex changes.
+  Items below 90% LLM confidence are written to reimport-review.json for human review.
 `.trim();
 
 const args = process.argv.slice(2);
-const opts = { output: '.', types: null, format: 'md', aggregate: false, user: null, pass: null, delay: null };
+const opts = { output: '.', types: null, format: 'md', aggregate: false, user: null, pass: null, delay: null, dryRun: false };
 const positional = [];
 
 for (let i = 0; i < args.length; i++) {
@@ -537,21 +895,28 @@ for (let i = 0; i < args.length; i++) {
     case '--user':      case '-u': opts.user = args[++i]; break;
     case '--pass':      case '-p': opts.pass = args[++i]; break;
     case '--delay':     case '-d': opts.delay = parseInt(args[++i], 10); break;
+    case '--dry-run':   case '-n': opts.dryRun = true; break;
     default:
       if (!args[i].startsWith('-')) positional.push(args[i]);
   }
 }
 
 const subcommand = positional[0];
-const urlArg = positional[1] ?? positional[0];
 
-if (!urlArg) {
+if (!positional.length) {
   console.error(USAGE);
   process.exit(1);
 }
 
 if (subcommand === 'auth') {
+  const urlArg = positional[1];
+  if (!urlArg) { console.error(USAGE); process.exit(1); }
   doAuth(urlArg).catch(e => { console.error(e.message); process.exit(1); });
+} else if (subcommand === 'reimport') {
+  const [, urlArg, origPath, editedPath] = positional;
+  if (!urlArg || !origPath || !editedPath) { console.error(USAGE); process.exit(1); }
+  doReimport(urlArg, origPath, editedPath, opts).catch(e => { console.error(e.message); process.exit(1); });
 } else {
+  const urlArg = positional[1] ?? positional[0];
   doPull(urlArg, opts).catch(e => { console.error(e.message); process.exit(1); });
 }
