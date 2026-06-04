@@ -8,6 +8,7 @@ import { spawn } from 'child_process';
 import { URL } from 'url';
 import TurndownService from 'turndown';
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { Document, Packer, Paragraph, HeadingLevel, TextRun, ExternalHyperlink } from 'docx';
 import JSZip from 'jszip';
 import { parse as parseHtml } from 'node-html-parser';
@@ -234,7 +235,20 @@ function spliceBlockText(block, newText) {
   return block.raw.slice(0, innerStart) + newInner + block.raw.slice(innerStart + block.innerHTML.length);
 }
 
-async function llmMerge(anthropic, change, blockRaw, fullRaw) {
+function initLlmClient() {
+  if (process.env.ANTHROPIC_API_KEY) {
+    return { type: 'anthropic', client: new Anthropic(), model: 'claude-sonnet-4-6' };
+  }
+  const baseURL = process.env.OPENAI_BASE_URL;
+  const apiKey = process.env.OPENAI_API_KEY ?? 'no-key'; // local servers often need any non-empty string
+  const model = process.env.OPENAI_MODEL ?? (baseURL ? 'llama3' : 'gpt-4o');
+  if (process.env.OPENAI_API_KEY || process.env.OPENAI_BASE_URL) {
+    return { type: 'openai', client: new OpenAI({ apiKey, baseURL }), model };
+  }
+  return null;
+}
+
+async function llmMerge(llmClient, change, blockRaw, fullRaw) {
   // Returns { updatedRaw: string, confidence: number, reasoning: string }
   // blockRaw is the specific block if we found one; fullRaw is the entire post content
   const context = blockRaw
@@ -262,29 +276,40 @@ Rules:
 
 Respond using the merge_result tool.`;
 
+  const toolSchema = {
+    type: 'object',
+    properties: {
+      updated:    { type: 'string',  description: 'The updated block or full post content' },
+      confidence: { type: 'integer', description: 'Confidence 0–100 that this is correct' },
+      reasoning:  { type: 'string',  description: 'Brief explanation and any concerns' },
+    },
+    required: ['updated', 'confidence', 'reasoning'],
+  };
+
   try {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 2048,
-      tools: [{
-        name: 'merge_result',
-        description: 'The result of applying the editorial change',
-        input_schema: {
-          type: 'object',
-          properties: {
-            updated: { type: 'string', description: 'The updated block or full post content' },
-            confidence: { type: 'integer', description: 'Confidence 0–100 that this is correct' },
-            reasoning: { type: 'string', description: 'Brief explanation of what was changed and any concerns' },
-          },
-          required: ['updated', 'confidence', 'reasoning'],
-        },
-      }],
-      tool_choice: { type: 'tool', name: 'merge_result' },
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const toolUse = response.content.find(b => b.type === 'tool_use');
-    if (!toolUse) throw new Error('No tool_use block in response');
-    return toolUse.input;
+    if (llmClient.type === 'anthropic') {
+      const response = await llmClient.client.messages.create({
+        model: llmClient.model,
+        max_tokens: 2048,
+        tools: [{ name: 'merge_result', description: 'The result of applying the editorial change', input_schema: toolSchema }],
+        tool_choice: { type: 'tool', name: 'merge_result' },
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const toolUse = response.content.find(b => b.type === 'tool_use');
+      if (!toolUse) throw new Error('No tool_use block in response');
+      return toolUse.input;
+    } else {
+      const response = await llmClient.client.chat.completions.create({
+        model: llmClient.model,
+        max_tokens: 2048,
+        tools: [{ type: 'function', function: { name: 'merge_result', description: 'The result of applying the editorial change', parameters: toolSchema } }],
+        tool_choice: { type: 'function', function: { name: 'merge_result' } },
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const toolCall = response.choices[0]?.message?.tool_calls?.[0];
+      if (!toolCall) throw new Error('No tool_call in response');
+      return JSON.parse(toolCall.function.arguments);
+    }
   } catch (e) {
     return { updated: blockRaw ?? fullRaw, confidence: 0, reasoning: `LLM call failed: ${e.message}` };
   }
@@ -525,7 +550,8 @@ function writeItemHtml(item, dir, typeSlug) {
   utimesSync(filePath, mtime, mtime);
 }
 
-async function writeAggregate(allCollected, outputDir, format, td) {
+async function writeAggregate(allCollected, outputDir, format, td, hostname) {
+  const baseName = (hostname ?? 'content').replace(/[^a-zA-Z0-9._-]/g, '-');
   if (format === 'docx') {
     const paragraphs = [];
     let firstPost = true;
@@ -539,8 +565,8 @@ async function writeAggregate(allCollected, outputDir, format, td) {
       }
     }
     const buf = await buildDocx(paragraphs);
-    writeFileSync(join(outputDir, 'content.docx'), buf);
-    console.log(`Aggregate saved → ./content.docx`);
+    writeFileSync(join(outputDir, `${baseName}.docx`), buf);
+    console.log(`Aggregate saved → ./${baseName}.docx`);
   } else if (format === 'html') {
     const parts = ['<!DOCTYPE html>', '<html lang="en">', '<head><meta charset="UTF-8"><title>Content Export</title></head>', '<body>'];
     for (const { typeSlug, items } of allCollected) {
@@ -554,8 +580,8 @@ async function writeAggregate(allCollected, outputDir, format, td) {
       }
     }
     parts.push('</body>', '</html>');
-    writeFileSync(join(outputDir, 'content.html'), parts.join('\n'));
-    console.log('Aggregate saved → ./content.html');
+    writeFileSync(join(outputDir, `${baseName}.html`), parts.join('\n'));
+    console.log(`Aggregate saved → ./${baseName}.html`);
   } else {
     const sections = [];
     for (const { typeName, items } of allCollected) {
@@ -571,8 +597,8 @@ async function writeAggregate(allCollected, outputDir, format, td) {
         ].join('\n'));
       }
     }
-    writeFileSync(join(outputDir, 'content.md'), sections.join('\n\n---\n\n') + '\n');
-    console.log('Aggregate saved → ./content.md');
+    writeFileSync(join(outputDir, `${baseName}.md`), sections.join('\n\n---\n\n') + '\n');
+    console.log(`Aggregate saved → ./${baseName}.md`);
   }
 }
 
@@ -595,8 +621,8 @@ async function doReimport(siteUrl, origPath, editedPath, opts) {
     process.exit(1);
   }
 
-  const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
-  if (!anthropic) console.log('Note: ANTHROPIC_API_KEY not set — unmatched changes will be written to review file only.\n');
+  const llmClient = initLlmClient();
+  if (!llmClient) console.log('Note: no LLM configured — unmatched changes will be written to review file only.\n  Set ANTHROPIC_API_KEY, or OPENAI_API_KEY / OPENAI_BASE_URL for any OpenAI-compatible endpoint.\n');
 
   process.stdout.write('Parsing original DOCX... ');
   const origPosts = await loadDocxPosts(origPath);
@@ -676,8 +702,8 @@ async function doReimport(siteUrl, origPath, editedPath, opts) {
             continue;
           }
           // Block found but has rich inline HTML — let LLM preserve formatting
-          if (anthropic) {
-            const result = await llmMerge(anthropic, change, matchBlock.raw, null);
+          if (llmClient) {
+            const result = await llmMerge(llmClient, change, matchBlock.raw, null);
             if (result.confidence >= 90) {
               replacements.push({ start: matchBlock.start, end: matchBlock.end, newBlockRaw: result.updated });
               console.log(`  ✓ LLM merged inline-rich block (${result.confidence}%)`);
@@ -699,8 +725,8 @@ async function doReimport(siteUrl, origPath, editedPath, opts) {
       }
 
       // --- LLM path: no block match, addition, or deletion ---
-      if (anthropic) {
-        const result = await llmMerge(anthropic, change, null, rawContent);
+      if (llmClient) {
+        const result = await llmMerge(llmClient, change, null, rawContent);
         if (result.confidence >= 90) {
           // LLM returned updated full content; we'll apply it as a whole-content replace
           replacements.push({ fullReplace: result.updated });
@@ -711,7 +737,7 @@ async function doReimport(siteUrl, origPath, editedPath, opts) {
         }
       } else {
         const label = change.type === 'added' ? `+ "${change.edit.slice(0, 60)}"` : `- "${change.orig.slice(0, 60)}"`;
-        console.log(`  WARN no match for ${label} — flagged for review (no ANTHROPIC_API_KEY)`);
+        console.log(`  WARN no match for ${label} — flagged for review (no LLM configured)`);
         reviewItems.push({ change_type: change.type, reason: 'no_match', ...change });
       }
     }
@@ -858,7 +884,7 @@ async function doPull(siteUrl, opts) {
   }
 
   if (aggregate && allCollected.length > 0) {
-    await writeAggregate(allCollected, outputDir, format, td);
+    await writeAggregate(allCollected, outputDir, format, td, hostname);
   }
 
   console.log('\nDone.');
@@ -886,7 +912,12 @@ Reimport options:
   --user,      -u <name>   WordPress username (required)
   --pass,      -p <pass>   WordPress application password (required)
 
-  Set ANTHROPIC_API_KEY to enable LLM-assisted merging of complex changes.
+  LLM configuration (pick one):
+    ANTHROPIC_API_KEY              Use Anthropic Claude (claude-sonnet-4-6)
+    OPENAI_API_KEY                 Use OpenAI or any OpenAI-compatible endpoint
+    OPENAI_BASE_URL                Override endpoint (Ollama: http://localhost:11434/v1)
+    OPENAI_MODEL                   Override model name (default: gpt-4o, or llama3 if base URL set)
+
   Items below 90% LLM confidence are written to reimport-review.json for human review.
 `.trim();
 
