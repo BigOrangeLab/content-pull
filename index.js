@@ -11,6 +11,7 @@ import { Document, Packer, Paragraph, HeadingLevel, PageBreak } from 'docx';
 
 const USER_AGENT = 'content-pull/1.0.0 (https://github.com/bigorangelab/content-pull)';
 const DEFAULT_DELAY_MS = 500;
+const WPCOM_API = 'https://public-api.wordpress.com/rest/v1.1';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -75,6 +76,43 @@ async function fetchAll(apiBase, restBase, authHeader, delay) {
     const totalPages = parseInt(headers.get('X-WP-TotalPages') ?? '1', 10);
     if (page >= totalPages) break;
     page++;
+  }
+  return items;
+}
+
+// --- WordPress.com REST API ---
+
+function normalizeWpcomPost(post) {
+  return {
+    slug: post.slug,
+    date: post.date,
+    modified: post.modified ?? post.date,
+    link: post.URL,
+    title: { rendered: post.title },
+    content: { rendered: post.content },
+  };
+}
+
+async function getWpcomTypes(siteId) {
+  const { body } = await apiFetch(`${WPCOM_API}/sites/${siteId}/post-types/`);
+  return Object.values(body.post_types ?? {})
+    .filter(t => t.api_queryable && !SKIP_TYPES.has(t.name))
+    .map(t => ({ slug: t.name, name: t.label, rest_base: t.name }));
+}
+
+async function fetchAllWpcom(siteId, typeSlug, delay) {
+  const items = [];
+  let offset = 0;
+  while (true) {
+    if (offset > 0) await sleep(delay);
+    const { body } = await apiFetch(
+      `${WPCOM_API}/sites/${siteId}/posts/?type=${typeSlug}&status=publish&number=100&offset=${offset}&fields=slug,date,modified,title,content,URL`
+    );
+    const posts = body.posts ?? [];
+    if (posts.length === 0) break;
+    items.push(...posts.map(normalizeWpcomPost));
+    offset += posts.length;
+    if (offset >= (body.found ?? 0)) break;
   }
   return items;
 }
@@ -235,24 +273,43 @@ async function writeAggregate(allCollected, outputDir, format, td) {
 
 async function doPull(siteUrl, opts) {
   const baseUrl = siteUrl.replace(/\/$/, '');
-  const apiBase = `${baseUrl}/wp-json/wp/v2`;
+  const { hostname } = new URL(baseUrl);
   const outputDir = resolve(opts.output);
   const format = opts.format ?? 'md';
   const aggregate = opts.aggregate ?? false;
+  const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
+  const delay = opts.delay ?? DEFAULT_DELAY_MS;
 
   let authHeader = null;
   if (opts.user && opts.pass) {
     authHeader = basicAuth(opts.user, opts.pass);
   } else {
     const stored = loadCredentials(siteUrl);
-    if (stored) {
-      authHeader = basicAuth(stored.user, stored.pass);
+    if (stored) authHeader = basicAuth(stored.user, stored.pass);
+  }
+
+  // Detect which API to use: wpcom-hosted sites go straight to the .com API;
+  // everything else tries the .org REST API first and falls back to .com.
+  let postTypes, fetchItems, apiLabel;
+  const preferWpcom = hostname.endsWith('.wordpress.com');
+
+  if (!preferWpcom) {
+    try {
+      const apiBase = `${baseUrl}/wp-json/wp/v2`;
+      const { body: types } = await apiFetch(`${apiBase}/types`, authHeader);
+      postTypes = Object.values(types).filter(t => t.rest_base && !SKIP_TYPES.has(t.slug));
+      fetchItems = type => fetchAll(apiBase, type.rest_base, authHeader, delay);
+      apiLabel = 'WordPress.org REST API';
+    } catch {
+      console.log('WordPress.org REST API unavailable, trying WordPress.com API...');
     }
   }
 
-  const { body: types } = await apiFetch(`${apiBase}/types`, authHeader);
-  let postTypes = Object.values(types)
-    .filter(t => t.rest_base && !SKIP_TYPES.has(t.slug));
+  if (!postTypes) {
+    postTypes = await getWpcomTypes(hostname);
+    fetchItems = type => fetchAllWpcom(hostname, type.slug, delay);
+    apiLabel = 'WordPress.com API';
+  }
 
   if (opts.types) {
     postTypes = postTypes.filter(t => opts.types.includes(t.slug));
@@ -263,10 +320,7 @@ async function doPull(siteUrl, opts) {
     process.exit(1);
   }
 
-  const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
-  const delay = opts.delay ?? DEFAULT_DELAY_MS;
-
-  console.log(`Pulling from: ${baseUrl}`);
+  console.log(`Pulling from: ${baseUrl} (${apiLabel})`);
   console.log(`Post types:   ${postTypes.map(t => t.slug).join(', ')}`);
   console.log(`Output format: ${format}${aggregate ? ' (aggregate)' : ''}`);
   console.log(`Request delay: ${delay}ms\n`);
@@ -281,7 +335,7 @@ async function doPull(siteUrl, opts) {
     process.stdout.write(`${type.name}... `);
     let items;
     try {
-      items = await fetchAll(apiBase, type.rest_base, authHeader, delay);
+      items = await fetchItems(type);
     } catch (e) {
       console.log(`skipped (${e.message})`);
       continue;
