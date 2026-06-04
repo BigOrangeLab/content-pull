@@ -27,6 +27,18 @@ const SKIP_TYPES = new Set([
 
 const CREDS_FILE = join(homedir(), '.content-pull', 'credentials.json');
 
+function decodeHtmlEntities(str) {
+  return str
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&nbsp;/g, ' ');
+}
+
+function plainText(html) {
+  return decodeHtmlEntities((html ?? '').replace(/<[^>]+>/g, ''));
+}
+
 function normalizeUrl(url) {
   return url.replace(/\/$/, '').toLowerCase();
 }
@@ -127,11 +139,7 @@ function normText(t) {
   return t.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-function decodeXmlEntities(s) {
-  return s
-    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"').replace(/&apos;/g, "'");
-}
+const decodeXmlEntities = decodeHtmlEntities;
 
 function parseDocxXml(xml) {
   const paras = [];
@@ -337,7 +345,7 @@ function inlineRuns(node, fmt = {}) {
   const runs = [];
   for (const child of node.childNodes) {
     if (child.nodeType === 3) {
-      const text = child.text.replace(/\s+/g, ' ');
+      const text = decodeHtmlEntities(child.text.replace(/\s+/g, ' '));
       if (text) runs.push(new TextRun({ text, ...fmt }));
     } else if (child.nodeType === 1) {
       const tag = child.tagName?.toLowerCase();
@@ -376,7 +384,7 @@ function htmlToDocxParagraphs(html) {
 
     const hm = tag.match(/^h([1-6])$/);
     if (hm) {
-      const text = node.text.replace(/\s+/g, ' ').trim();
+      const text = decodeHtmlEntities(node.text.replace(/\s+/g, ' ').trim());
       if (text) paras.push(new Paragraph({ text, heading: HeadingLevel[`HEADING_${hm[1]}`] }));
       return;
     }
@@ -410,7 +418,7 @@ function htmlToDocxParagraphs(html) {
         break;
       }
       case 'figcaption': {
-        const text = node.text.trim();
+        const text = decodeHtmlEntities(node.text.trim());
         if (text) paras.push(new Paragraph({ children: [new TextRun({ text, size: 18, color: '666666' })] }));
         break;
       }
@@ -462,7 +470,7 @@ function metaParagraph(item, typeSlug, pageBreakBefore = false) {
 // --- Serialisers ---
 
 function writeItemMarkdown(item, td, dir) {
-  const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+  const title = plainText(item.title?.rendered) || item.slug;
   const md = td.turndown(item.content?.rendered ?? '');
   const frontmatter = [
     '---',
@@ -480,7 +488,7 @@ function writeItemMarkdown(item, td, dir) {
 }
 
 async function writeItemDocx(item, dir, typeSlug) {
-  const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+  const title = plainText(item.title?.rendered) || item.slug;
   const paragraphs = [
     metaParagraph(item, typeSlug),
     new Paragraph({ text: title, heading: HeadingLevel.HEADING_1 }),
@@ -491,7 +499,7 @@ async function writeItemDocx(item, dir, typeSlug) {
 }
 
 function writeItemHtml(item, dir, typeSlug) {
-  const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+  const title = plainText(item.title?.rendered) || item.slug;
   const meta = JSON.stringify({ slug: item.slug, type: typeSlug, link: item.link, date: item.date, modified: item.modified });
   const out = [
     '<!DOCTYPE html>',
@@ -523,7 +531,7 @@ async function writeAggregate(allCollected, outputDir, format, td) {
     let firstPost = true;
     for (const { typeSlug, items } of allCollected) {
       for (const item of items) {
-        const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+        const title = plainText(item.title?.rendered) || item.slug;
         paragraphs.push(metaParagraph(item, typeSlug, !firstPost));
         paragraphs.push(new Paragraph({ text: title, heading: HeadingLevel.HEADING_1 }));
         paragraphs.push(...htmlToDocxParagraphs(item.content?.rendered ?? ''));
@@ -537,7 +545,7 @@ async function writeAggregate(allCollected, outputDir, format, td) {
     const parts = ['<!DOCTYPE html>', '<html lang="en">', '<head><meta charset="UTF-8"><title>Content Export</title></head>', '<body>'];
     for (const { typeSlug, items } of allCollected) {
       for (const item of items) {
-        const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+        const title = plainText(item.title?.rendered) || item.slug;
         const meta = JSON.stringify({ slug: item.slug, type: typeSlug, link: item.link, date: item.date, modified: item.modified });
         parts.push(`<article data-content-pull-meta='${meta}'>`);
         parts.push(`<h1>${item.title?.rendered ?? title}</h1>`);
@@ -553,7 +561,7 @@ async function writeAggregate(allCollected, outputDir, format, td) {
     for (const { typeName, items } of allCollected) {
       sections.push(`# ${typeName}\n`);
       for (const item of items) {
-        const title = item.title?.rendered?.replace(/<[^>]+>/g, '') ?? item.slug;
+        const title = plainText(item.title?.rendered) || item.slug;
         const md = td.turndown(item.content?.rendered ?? '');
         sections.push([
           `## ${title}`,
