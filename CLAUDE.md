@@ -8,7 +8,7 @@ A single-file Node.js CLI (`index.js`). No build step. No framework. Native `fet
 
 ## File structure
 
-```
+```text
 index.js          Entry point and entire implementation
 package.json      Package metadata and dependencies
 ```
@@ -33,7 +33,7 @@ All logic lives in `index.js`. Key sections:
 - **WordPress.com API helpers** (`normalizeWpcomPost`, `getWpcomTypes`, `fetchAllWpcom`) — parallel to the `.org` fetch functions; normalise wpcom post shape to match `.org` shape so all serialisers are API-agnostic
 - **DOCX helpers** (`inlineRuns`, `htmlToDocxParagraphs`, `buildDocx`, `metaParagraph`) — convert HTML directly to `docx` paragraph objects via `node-html-parser`; `buildDocx` defines the `ContentPullMeta` custom paragraph style
 - **HTML serialiser** (`writeItemHtml`) — writes a self-contained `.html` file with `<meta>` tags and `data-content-pull-meta` attribute
-- **Serialisers** (`writeItemMarkdown`, `writeItemDocx`, `writeAggregate`) — write individual or combined output files; `writeAggregate` names the file after the site hostname
+- **Serialisers** (`writeItemMarkdown`, `writeItemDocx`, `writeItemHtml`, `writeAggregate`) — write individual or combined output files; all three item serialisers accept an optional `fileSlug` override (used by `--layout url` to write `index.*` files); `writeAggregate` names the file after the site hostname
 - **Reimport helpers** (`normText`, `parseDocxXml`, `loadDocxPosts`, `diffParagraphs`, `parseWpBlocks`, `spliceBlockText`, `initLlmClient`, `llmMerge`) — paragraph-level DOCX diff and block-splice pipeline; LLM dispatch for complex cases
 - **`doReimport(siteUrl, origPath, editedPath, opts)`** — orchestrates the full reimport flow; writes `reimport-review.json` for low-confidence items
 - **`doAuth(siteUrl)`** — Application Passwords OAuth-style flow: discovers the auth endpoint from `/wp-json/`, starts a local HTTP server, opens browser, captures callback
@@ -62,6 +62,7 @@ All logic lives in `index.js`. Key sections:
 ### API detection
 
 `doPull` detects which API to use:
+
 1. Hostname ends with `.wordpress.com` → wpcom API directly
 2. Otherwise, tries `.org` API (`/wp-json/wp/v2/types`); if that throws, falls back to wpcom
 
@@ -73,6 +74,8 @@ The `docx` package (v8) is used for Word document generation. Key design decisio
 - **`ContentPullMeta` style** — a custom named paragraph style (`w:val="ContentPullMeta"`) defined in every generated DOCX. Each post begins with one such paragraph containing JSON: `{"slug":..., "type":..., "link":..., "date":..., "modified":...}`. This survives human editing and is the hook for `reimport`.
 - **Page breaks** — `pageBreakBefore: true` on the `ContentPullMeta` paragraph of every post except the first.
 - **Aggregate filename** — uses the site hostname (`example.com.docx`), sanitised for filesystem safety.
+- **Non-aggregate output** — individual files always land inside a `<hostname>/` subdirectory of `--output`. Layout `type` groups by post type (`<hostname>/<type>/<slug>.ext`); layout `url` mirrors the canonical URL path (`<hostname>/<url-path>/index.ext`).
+- **`--layout url`** — strips leading/trailing slashes from `item.link`'s pathname and uses that as the directory, with `index` as the filename base. Falls back to `item.slug` if the pathname is empty.
 
 ## Reimport
 
@@ -113,7 +116,6 @@ The delay is applied via a `sleep` helper before each request after the first, s
 ## User-Agent
 
 All requests send `User-Agent: content-pull/1.0.0 (https://github.com/bigorangelab/content-pull)`. Update the `USER_AGENT` constant at the top of `index.js` when the version changes.
-
 
 ## Things to keep in mind
 

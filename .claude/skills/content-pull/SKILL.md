@@ -23,7 +23,7 @@ metadata:
 - Generating a Word document for editorial review, with changes parseable back to WordPress
 - Pulling content from WordPress.com-hosted sites where the self-hosted REST API is unavailable
 
-Do NOT use the `auth` subcommand in agentic contexts — it opens a browser. See [Credentials (non-interactive)](#credentials-non-interactive) below.
+Do NOT use the `auth` subcommand in agentic contexts — it opens a browser. See [Credentials (non-interactive)](#2-credentials-non-interactive) below.
 
 ## Inputs required
 
@@ -102,6 +102,7 @@ node index.js https://example.com --output ./out --delay 1000
 | `--output` | `-o` | `.` (cwd) | Directory to write files into |
 | `--types` | `-t` | all public | Comma-separated post type slugs |
 | `--format` | `-f` | `md` | Output format: `md`, `html`, or `docx` |
+| `--layout` | `-l` | `type` | File layout: `type` or `url` |
 | `--aggregate` | `-a` | off | Combine all posts into one file named after the domain |
 | `--user` | `-u` | from creds file | WordPress username |
 | `--pass` | `-p` | from creds file | WordPress application password |
@@ -115,21 +116,34 @@ WordPress.com public content requires no credentials.
 
 ### 5. Understand the output
 
-Files are written to `<outputDir>/<postType>/<slug>.md`. Each file has YAML frontmatter followed by the post body as Markdown:
+Non-aggregate files always land in a subdirectory named after the site hostname. The `--layout` flag controls the path structure within that:
 
-```
-site-content/
-  post/
-    hello-world.md
-    my-second-post.md
-  page/
-    about.md
-    contact.md
-  event/          ← custom post types are included automatically
-    conference-2025.md
+**`--layout type` (default)** — `<outputDir>/<hostname>/<postType>/<slug>.ext`
+
+```text
+out/
+  example.com/
+    post/
+      hello-world.md
+    page/
+      about.md
+    event/
+      conference-2025.md
 ```
 
-Frontmatter fields on every file:
+**`--layout url`** — `<outputDir>/<hostname>/<canonical-url-path>/index.ext`
+
+```text
+out/
+  example.com/
+    blog/
+      hello-world/
+        index.md
+    about/
+      index.md
+```
+
+Markdown frontmatter fields:
 
 ```yaml
 ---
@@ -156,7 +170,7 @@ node index.js https://example.com --output ./out --format docx --aggregate --typ
 
 Each post begins with a `ContentPullMeta` paragraph — a small grey monospaced line containing a JSON object:
 
-```
+```json
 {"slug":"hello-world","type":"post","link":"https://example.com/hello-world/","date":"2024-01-15T09:30:00","modified":"2024-06-01T14:22:00"}
 ```
 
@@ -206,6 +220,7 @@ node index.js reimport https://example.com original.docx edited.docx --dry-run
 ```
 
 The reimport command:
+
 1. Parses both DOCXs and diffs paragraphs per post (LCS algorithm)
 2. For each change, fetches the post's raw Gutenberg block source from WordPress (`context=edit`, requires auth)
 3. Matches changed paragraphs to leaf blocks by normalised text comparison
@@ -238,6 +253,7 @@ Without an LLM, only programmatic matches are applied; everything else is writte
 ### Review file
 
 `reimport-review.json` is written to the current directory when items cannot be applied at ≥90% confidence. Each entry contains:
+
 - `change_type` — `changed`, `added`, or `removed`
 - `orig` / `edit` — original and edited paragraph text
 - `block_raw` — the WordPress block source being modified
@@ -251,7 +267,7 @@ This file can be passed directly to an LLM agent with WordPress REST API access 
 
 Successful run prints:
 
-```
+```text
 Pulling from: https://example.com (WordPress.org REST API)
 Post types:   post, page
 Output format: md
@@ -265,7 +281,7 @@ Done.
 
 For a WordPress.com site the label will read `WordPress.com API`. For DOCX aggregate:
 
-```
+```text
 Pulling from: https://example.com (WordPress.org REST API)
 Post types:   post, page
 Output format: docx (aggregate)
@@ -278,7 +294,7 @@ Aggregate saved → ./example.com.docx
 Done.
 ```
 
-Exit code 0. Individual files go in `<outputDir>/<postType>/`. Aggregate files are named after the site hostname (`example.com.md`, `example.com.docx`, `example.com.html`) and written to the output root.
+Exit code 0. Individual files go in `<outputDir>/<hostname>/<postType>/` (layout `type`) or `<outputDir>/<hostname>/<url-path>/` (layout `url`). Aggregate files are named after the site hostname (`example.com.md`, `example.com.docx`, `example.com.html`) and written directly to the output root.
 
 To spot-check a file:
 

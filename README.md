@@ -39,17 +39,29 @@ content-pull https://example.com
 node index.js <url>
 ```
 
-This fetches all publicly available post types — posts, pages, and any custom post types registered with the REST API — and saves them as Markdown files in subdirectories of the current working directory.
+This fetches all publicly available post types — posts, pages, and any custom post types registered with the REST API — and saves them as Markdown files. Files are grouped by post type inside a folder named after the site domain:
 
+```text
+./example.com/
+  post/
+    hello-world.md
+    my-second-post.md
+  page/
+    about.md
+    contact.md
+  product/         ← custom post types too
+    widget-pro.md
 ```
-./post/
-  hello-world.md
-  my-second-post.md
-./page/
-  about.md
-  contact.md
-./product/         ← custom post types too
-  widget-pro.md
+
+With `--layout url`, files follow the canonical URL path of each post instead:
+
+```text
+./example.com/
+  blog/
+    hello-world/
+      index.md
+  about/
+    index.md
 ```
 
 ### Options
@@ -59,6 +71,7 @@ This fetches all publicly available post types — posts, pages, and any custom 
 | `--output <dir>` | `-o` | Directory to write files into (default: current directory) |
 | `--types <list>` | `-t` | Comma-separated post type slugs to pull (default: all public types) |
 | `--format <fmt>` | `-f` | Output format: `md` (default), `html`, or `docx` |
+| `--layout <mode>` | `-l` | File layout: `type` (default) or `url` |
 | `--aggregate` | `-a` | Combine all posts into a single file named after the site domain |
 | `--user <name>` | `-u` | WordPress username (overrides stored credentials) |
 | `--pass <pass>` | `-p` | WordPress application password (overrides stored credentials) |
@@ -67,8 +80,13 @@ This fetches all publicly available post types — posts, pages, and any custom 
 ### Examples
 
 ```bash
-# Pull everything as Markdown (default)
-node index.js https://example.com --output ./site-backup
+# Pull everything as Markdown, grouped by post type
+node index.js https://example.com --output ./out
+# → ./out/example.com/post/hello-world.md
+
+# Mirror the site's URL structure
+node index.js https://example.com --layout url --output ./out
+# → ./out/example.com/blog/hello-world/index.md
 
 # Pull only posts and pages
 node index.js https://example.com --types post,page
@@ -79,13 +97,15 @@ node index.js https://example.com --aggregate --output ./out
 
 # Pull as individual Word documents
 node index.js https://example.com --format docx --output ./out
+# → ./out/example.com/post/hello-world.docx
 
 # Pull as a single Word document (useful for editorial review)
 node index.js https://example.com --format docx --aggregate --output ./out
 # → ./out/example.com.docx
 
-# Pull as raw HTML files
-node index.js https://example.com --format html --output ./out
+# Pull as raw HTML files mirroring the URL structure
+node index.js https://example.com --format html --layout url --output ./out
+# → ./out/example.com/blog/hello-world/index.html
 
 # Pull with explicit credentials
 node index.js https://example.com --user george --pass abcd-efgh-ijkl-mnop
@@ -143,7 +163,7 @@ Credentials are stored in `~/.content-pull/credentials.json`, keyed by site URL.
 
 ### Markdown (default)
 
-Each file is saved as `<post-type>/<slug>.md` with YAML frontmatter:
+Each file is saved as `<domain>/<post-type>/<slug>.md` (layout `type`) or `<domain>/<url-path>/index.md` (layout `url`), with YAML frontmatter:
 
 ```markdown
 ---
@@ -166,11 +186,11 @@ With `--aggregate`, a single file named after the site hostname (e.g. `example.c
 
 ### HTML (`--format html`)
 
-Each post is saved as `<post-type>/<slug>.html` — a self-contained HTML document with `<meta>` tags for date, modified, and canonical URL. With `--aggregate`, a single `example.com.html` is written containing all posts as `<article>` elements, each with a `data-content-pull-meta` attribute carrying the same JSON object used by DOCX delimiters.
+Each post is saved as a self-contained `.html` file with `<meta>` tags for date, modified, and canonical URL. The path follows the active `--layout` setting. With `--aggregate`, a single `example.com.html` is written containing all posts as `<article>` elements, each with a `data-content-pull-meta` attribute carrying the same JSON object used by DOCX delimiters.
 
 ### Word documents (`--format docx`)
 
-Each post is saved as `<post-type>/<slug>.docx` (or a single `example.com.docx` with `--aggregate`). Content is converted directly from WordPress's rendered HTML — headings, paragraphs, bold, italic, links, and tables are preserved; images are skipped.
+Each post is saved as a `.docx` file. The path follows the active `--layout` setting. With `--aggregate`, a single `example.com.docx` is written. Content is converted directly from WordPress's rendered HTML — headings, paragraphs, bold, italic, links, and tables are preserved; images are skipped.
 
 Each post begins with a `ContentPullMeta` paragraph — a small grey monospaced line containing a JSON object that identifies the post:
 

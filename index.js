@@ -216,7 +216,7 @@ function parseWpBlocks(raw) {
     blocks.push({
       name,
       innerHTML,
-      innerText: stripTags(innerHTML),
+      innerText: plainText(innerHTML),
       start: open.index,
       end: closePos + closeTag.length,
       raw: raw.slice(open.index, closePos + closeTag.length),
@@ -494,7 +494,7 @@ function metaParagraph(item, typeSlug, pageBreakBefore = false) {
 
 // --- Serialisers ---
 
-function writeItemMarkdown(item, td, dir) {
+function writeItemMarkdown(item, td, dir, fileSlug = item.slug) {
   const title = plainText(item.title?.rendered) || item.slug;
   const md = td.turndown(item.content?.rendered ?? '');
   const frontmatter = [
@@ -506,13 +506,13 @@ function writeItemMarkdown(item, td, dir) {
     '---',
     '',
   ].join('\n');
-  const filePath = join(dir, `${item.slug}.md`);
+  const filePath = join(dir, `${fileSlug}.md`);
   writeFileSync(filePath, `${frontmatter}\n${md}\n`);
   const mtime = new Date(item.modified);
   utimesSync(filePath, mtime, mtime);
 }
 
-async function writeItemDocx(item, dir, typeSlug) {
+async function writeItemDocx(item, dir, typeSlug, fileSlug = item.slug) {
   const title = plainText(item.title?.rendered) || item.slug;
   const paragraphs = [
     metaParagraph(item, typeSlug),
@@ -520,10 +520,10 @@ async function writeItemDocx(item, dir, typeSlug) {
     ...htmlToDocxParagraphs(item.content?.rendered ?? ''),
   ];
   const buf = await buildDocx(paragraphs);
-  writeFileSync(join(dir, `${item.slug}.docx`), buf);
+  writeFileSync(join(dir, `${fileSlug}.docx`), buf);
 }
 
-function writeItemHtml(item, dir, typeSlug) {
+function writeItemHtml(item, dir, typeSlug, fileSlug = item.slug) {
   const title = plainText(item.title?.rendered) || item.slug;
   const meta = JSON.stringify({ slug: item.slug, type: typeSlug, link: item.link, date: item.date, modified: item.modified });
   const out = [
@@ -544,7 +544,7 @@ function writeItemHtml(item, dir, typeSlug) {
     '</body>',
     '</html>',
   ].join('\n');
-  const filePath = join(dir, `${item.slug}.html`);
+  const filePath = join(dir, `${fileSlug}.html`);
   writeFileSync(filePath, out);
   const mtime = new Date(item.modified);
   utimesSync(filePath, mtime, mtime);
@@ -795,6 +795,7 @@ async function doPull(siteUrl, opts) {
   const outputDir = resolve(opts.output);
   const format = opts.format ?? 'md';
   const aggregate = opts.aggregate ?? false;
+  const layout = opts.layout ?? 'type';
   const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
   const delay = opts.delay ?? DEFAULT_DELAY_MS;
 
@@ -840,7 +841,7 @@ async function doPull(siteUrl, opts) {
 
   console.log(`Pulling from: ${baseUrl} (${apiLabel})`);
   console.log(`Post types:   ${postTypes.map(t => t.slug).join(', ')}`);
-  console.log(`Output format: ${format}${aggregate ? ' (aggregate)' : ''}`);
+  console.log(`Output format: ${format}${aggregate ? ' (aggregate)' : ''}${!aggregate && layout !== 'type' ? ` (layout: ${layout})` : ''}`);
   console.log(`Request delay: ${delay}ms\n`);
 
   mkdirSync(outputDir, { recursive: true });
@@ -868,18 +869,29 @@ async function doPull(siteUrl, opts) {
       allCollected.push({ typeName: type.name, typeSlug: type.slug, items });
       console.log(`${items.length} collected`);
     } else {
-      const dir = join(outputDir, type.slug);
-      mkdirSync(dir, { recursive: true });
       for (const item of items) {
-        if (format === 'docx') {
-          await writeItemDocx(item, dir, type.slug);
-        } else if (format === 'html') {
-          writeItemHtml(item, dir, type.slug);
+        let itemDir, fileSlug;
+        if (layout === 'url') {
+          const urlPathname = new URL(item.link).pathname.replace(/^\/|\/$/g, '');
+          itemDir = join(outputDir, hostname, urlPathname || item.slug);
+          fileSlug = 'index';
         } else {
-          writeItemMarkdown(item, td, dir);
+          itemDir = join(outputDir, hostname, type.slug);
+          fileSlug = item.slug;
+        }
+        mkdirSync(itemDir, { recursive: true });
+        if (format === 'docx') {
+          await writeItemDocx(item, itemDir, type.slug, fileSlug);
+        } else if (format === 'html') {
+          writeItemHtml(item, itemDir, type.slug, fileSlug);
+        } else {
+          writeItemMarkdown(item, td, itemDir, fileSlug);
         }
       }
-      console.log(`${items.length} saved → ./${type.slug}/`);
+      const dirHint = layout === 'url'
+        ? `./${hostname}/<url-path>/`
+        : `./${hostname}/${type.slug}/`;
+      console.log(`${items.length} saved → ${dirHint}`);
     }
   }
 
@@ -902,7 +914,8 @@ Pull options:
   --output,    -o <dir>    Output directory (default: current directory)
   --types,     -t <list>   Comma-separated post types (default: all public)
   --format,    -f <fmt>    Output format: md (default), html, or docx
-  --aggregate, -a          Combine all posts into a single file
+  --layout,    -l <mode>   File layout: type (default) or url
+  --aggregate, -a          Combine all posts into a single file named after the domain
   --user,      -u <name>   WordPress username (overrides stored credentials)
   --pass,      -p <pass>   WordPress application password
   --delay,     -d <ms>     Milliseconds to wait between requests (default: ${DEFAULT_DELAY_MS})
@@ -922,7 +935,7 @@ Reimport options:
 `.trim();
 
 const args = process.argv.slice(2);
-const opts = { output: '.', types: null, format: 'md', aggregate: false, user: null, pass: null, delay: null, dryRun: false };
+const opts = { output: '.', types: null, format: 'md', layout: 'type', aggregate: false, user: null, pass: null, delay: null, dryRun: false };
 const positional = [];
 
 for (let i = 0; i < args.length; i++) {
@@ -930,6 +943,7 @@ for (let i = 0; i < args.length; i++) {
     case '--output':    case '-o': opts.output = args[++i]; break;
     case '--types':     case '-t': opts.types = args[++i].split(',').map(s => s.trim()); break;
     case '--format':    case '-f': opts.format = args[++i]; break;
+    case '--layout':    case '-l': opts.layout = args[++i]; break;
     case '--aggregate': case '-a': opts.aggregate = true; break;
     case '--user':      case '-u': opts.user = args[++i]; break;
     case '--pass':      case '-p': opts.pass = args[++i]; break;
