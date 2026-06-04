@@ -1,0 +1,16 @@
+{
+  "name": "content-pull",
+  "version": "1.0.0",
+  "description": "Pull WordPress site content via REST API and save as Markdown files",
+  "type": "module",
+  "bin": {
+    "content-pull": "./index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "turndown": "^7.2.0"
+  },
+  "license": "GPL-2.0-or-later"
+}
