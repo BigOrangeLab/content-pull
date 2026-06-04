@@ -58,8 +58,8 @@ This fetches all publicly available post types — posts, pages, and any custom 
 |------|-------|-------------|
 | `--output <dir>` | `-o` | Directory to write files into (default: current directory) |
 | `--types <list>` | `-t` | Comma-separated post type slugs to pull (default: all public types) |
-| `--format <fmt>` | `-f` | Output format: `md` (default) or `docx` |
-| `--aggregate` | `-a` | Combine all posts into a single file (`content.md` or `content.docx`) |
+| `--format <fmt>` | `-f` | Output format: `md` (default), `html`, or `docx` |
+| `--aggregate` | `-a` | Combine all posts into a single file named after the site domain |
 | `--user <name>` | `-u` | WordPress username (overrides stored credentials) |
 | `--pass <pass>` | `-p` | WordPress application password (overrides stored credentials) |
 | `--delay <ms>` | `-d` | Milliseconds to wait between requests (default: `500`) |
@@ -73,14 +73,19 @@ node index.js https://example.com --output ./site-backup
 # Pull only posts and pages
 node index.js https://example.com --types post,page
 
-# Pull as a single aggregated Markdown file
+# Pull as a single aggregated Markdown file (named after the site)
 node index.js https://example.com --aggregate --output ./out
+# → ./out/example.com.md
 
 # Pull as individual Word documents
 node index.js https://example.com --format docx --output ./out
 
 # Pull as a single Word document (useful for editorial review)
 node index.js https://example.com --format docx --aggregate --output ./out
+# → ./out/example.com.docx
+
+# Pull as raw HTML files
+node index.js https://example.com --format html --output ./out
 
 # Pull with explicit credentials
 node index.js https://example.com --user george --pass abcd-efgh-ijkl-mnop
@@ -157,11 +162,15 @@ Paragraph text, **bold**, _italic_, [links](https://example.com), etc.
 
 File modification times (`mtime`) are set to match the post's `modified` date from WordPress, so the filesystem timestamps reflect when content was last updated on the site.
 
-With `--aggregate`, a single `content.md` is written to the output directory. Posts are separated by `---` rules and each opens with `## <title>` and a metadata line.
+With `--aggregate`, a single file named after the site hostname (e.g. `example.com.md`) is written to the output directory. Posts are separated by `---` rules and each opens with `## <title>` and a metadata line.
+
+### HTML (`--format html`)
+
+Each post is saved as `<post-type>/<slug>.html` — a self-contained HTML document with `<meta>` tags for date, modified, and canonical URL. With `--aggregate`, a single `example.com.html` is written containing all posts as `<article>` elements, each with a `data-content-pull-meta` attribute carrying the same JSON object used by DOCX delimiters.
 
 ### Word documents (`--format docx`)
 
-Each post is saved as `<post-type>/<slug>.docx` (or a single `content.docx` with `--aggregate`). Headings and paragraph structure are preserved; inline formatting (bold, italic, links) is converted to plain text.
+Each post is saved as `<post-type>/<slug>.docx` (or a single `example.com.docx` with `--aggregate`). Content is converted directly from WordPress's rendered HTML — headings, paragraphs, bold, italic, links, and tables are preserved; images are skipped.
 
 Each post begins with a `ContentPullMeta` paragraph — a small grey monospaced line containing a JSON object that identifies the post:
 
@@ -173,47 +182,52 @@ In an aggregate DOCX, every post (except the first) starts on a new page. The `C
 
 ## Round-trip editing
 
-The DOCX format supports an editorial workflow: pull content, edit the Word document, then parse the changes back out to push upstream to WordPress.
+The `reimport` subcommand applies an edited DOCX back to WordPress. It diffs the original and edited documents at the paragraph level, maps changes to Gutenberg blocks in the post source, and pushes updates via the REST API.
+
+```bash
+content-pull reimport https://example.com original.docx edited.docx [--dry-run]
+```
+
+### How it works
+
+1. Both DOCXs are parsed and split on `ContentPullMeta` paragraphs to identify each post
+2. A paragraph-level LCS diff finds what changed, was added, or was removed per post
+3. For each changed paragraph, the tool fetches the post's raw block source (`content.raw`, requires auth) and finds the matching Gutenberg block by text comparison
+4. **Simple changes** (plain text swap in a leaf block) are applied programmatically
+5. **Complex changes** (rich inline HTML, additions, deletions) are sent to an LLM to determine the correct block edit
+6. Changes where LLM confidence is below 90% are written to `reimport-review.json` for human or agent review
+
+### LLM configuration
+
+Set one of these to enable LLM-assisted merging:
+
+| Variable | Effect |
+|----------|--------|
+| `ANTHROPIC_API_KEY` | Use Anthropic Claude (`claude-sonnet-4-6`) |
+| `OPENAI_API_KEY` | Use OpenAI (`gpt-4o` by default) |
+| `OPENAI_BASE_URL` | Point at any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio) |
+| `OPENAI_MODEL` | Override the model name (e.g. `llama3`, `mistral`) |
+
+```bash
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-... content-pull reimport https://example.com original.docx edited.docx
+
+# Ollama (no API key needed)
+OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODEL=llama3 \
+  content-pull reimport https://example.com original.docx edited.docx
+```
+
+Without any LLM configured, only programmatic matches are applied; everything else goes to the review file.
 
 ### How delimiters work
 
-The `ContentPullMeta` paragraph style is stored in the DOCX XML as:
+Each post in a generated DOCX begins with a `ContentPullMeta`-styled paragraph (grey monospace text) containing a JSON object:
 
-```xml
-<w:pStyle w:val="ContentPullMeta"/>
+```json
+{"slug":"hello-world","type":"post","link":"https://example.com/hello-world/","date":"2024-01-15T09:30:00","modified":"2024-06-01T14:22:00"}
 ```
 
-To parse edited content back out:
-
-1. Unzip the `.docx` file (it is a ZIP archive).
-2. Read `word/document.xml`.
-3. Find every `<w:p>` element whose `<w:pPr>` contains `<w:pStyle w:val="ContentPullMeta"/>`.
-4. The text of that paragraph is the JSON metadata for the post that follows it.
-5. Collect all subsequent paragraphs (as text or HTML) until the next `ContentPullMeta` paragraph — that is the edited content for that post.
-6. Use the `slug`, `type`, and `link` fields from the JSON to identify the WordPress post to update via the REST API.
-
-### Minimal Node.js parse example
-
-```js
-import { readFileSync } from 'fs';
-import { unzipSync } from 'zlib'; // or use a zip library
-// Parse word/document.xml from the docx ZIP, then:
-
-const posts = [];
-let current = null;
-
-for (const para of paragraphs) {
-  if (para.style === 'ContentPullMeta') {
-    if (current) posts.push(current);
-    current = { meta: JSON.parse(para.text), lines: [] };
-  } else if (current) {
-    current.lines.push(para.text);
-  }
-}
-if (current) posts.push(current);
-// posts[n].meta.slug  → WordPress post slug
-// posts[n].lines      → edited content paragraphs
-```
+The equivalent in HTML aggregate output is `<article data-content-pull-meta='{"slug":...}'>`. Both are preserved through editing and are what `reimport` uses to match content back to WordPress posts.
 
 ## Post types
 

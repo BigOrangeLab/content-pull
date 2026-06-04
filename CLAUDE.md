@@ -4,7 +4,7 @@ CLI tool that pulls WordPress site content via the REST API and saves it as Mark
 
 ## What this is
 
-A single-file Node.js CLI (`index.js`). No build step. No framework. Dependencies are minimal: only `turndown` for HTML→Markdown conversion. Native `fetch` (Node 18+) handles all HTTP.
+A single-file Node.js CLI (`index.js`). No build step. No framework. Native `fetch` (Node 18+) handles all HTTP.
 
 ## File structure
 
@@ -18,19 +18,25 @@ package.json      Package metadata and dependencies
 ```bash
 node index.js <url> [options]
 node index.js auth <url>
+node index.js reimport <url> <original.docx> <edited.docx> [--dry-run]
 ```
 
-No compilation needed. `npm install` to get `turndown`, then run directly.
+No compilation needed. `npm install`, then run directly.
 
 ## Architecture
 
 All logic lives in `index.js`. Key sections:
 
+- **Utilities** (`decodeHtmlEntities`, `plainText`, `sleep`, `stripTags`) — shared helpers used throughout
 - **Credential helpers** (`loadCredentials`, `saveCredentials`, `basicAuth`) — read/write `~/.content-pull/credentials.json`
+- **`apiFetch(url, authHeader, method, data)`** — thin fetch wrapper; supports GET and POST with JSON body
+- **WordPress.com API helpers** (`normalizeWpcomPost`, `getWpcomTypes`, `fetchAllWpcom`) — parallel to the `.org` fetch functions; normalise wpcom post shape to match `.org` shape so all serialisers are API-agnostic
+- **DOCX helpers** (`inlineRuns`, `htmlToDocxParagraphs`, `buildDocx`, `metaParagraph`) — convert HTML directly to `docx` paragraph objects via `node-html-parser`; `buildDocx` defines the `ContentPullMeta` custom paragraph style
+- **HTML serialiser** (`writeItemHtml`) — writes a self-contained `.html` file with `<meta>` tags and `data-content-pull-meta` attribute
+- **Serialisers** (`writeItemMarkdown`, `writeItemDocx`, `writeAggregate`) — write individual or combined output files; `writeAggregate` names the file after the site hostname
+- **Reimport helpers** (`normText`, `parseDocxXml`, `loadDocxPosts`, `diffParagraphs`, `parseWpBlocks`, `spliceBlockText`, `initLlmClient`, `llmMerge`) — paragraph-level DOCX diff and block-splice pipeline; LLM dispatch for complex cases
+- **`doReimport(siteUrl, origPath, editedPath, opts)`** — orchestrates the full reimport flow; writes `reimport-review.json` for low-confidence items
 - **`doAuth(siteUrl)`** — Application Passwords OAuth-style flow: discovers the auth endpoint from `/wp-json/`, starts a local HTTP server, opens browser, captures callback
-- **WordPress.com API helpers** (`normalizeWpcomPost`, `getWpcomTypes`, `fetchAllWpcom`) — parallel to the `.org` fetch functions; normalize wpcom post shape to match `.org` shape so all serialisers are API-agnostic
-- **DOCX helpers** (`markdownToDocxParagraphs`, `buildDocx`, `metaParagraph`) — convert Markdown text to `docx` paragraph objects; `buildDocx` defines the `ContentPullMeta` custom paragraph style
-- **Serialisers** (`writeItemMarkdown`, `writeItemDocx`, `writeAggregate`) — write individual or combined output files in the requested format
 - **`doPull(siteUrl, opts)`** — detects which API to use, fetches post types, paginates through all posts, delegates to the appropriate serialiser
 - **CLI entry point** — simple manual arg parsing at the bottom, no commander/yargs
 
@@ -63,14 +69,31 @@ All logic lives in `index.js`. Key sections:
 
 The `docx` package (v8) is used for Word document generation. Key design decisions:
 
-- **`ContentPullMeta` style** — a custom named paragraph style (`w:val="ContentPullMeta"`) defined in every generated DOCX. Each post begins with one such paragraph containing a JSON string: `{"slug":..., "type":..., "link":..., "date":..., "modified":...}`. This survives human editing and is the hook for round-trip parsing.
-- **Page breaks** — `pageBreakBefore: true` on the `ContentPullMeta` paragraph of every post except the first. This keeps the break attached to the start of the post rather than orphaned at the end of the previous one.
-- Inline Markdown formatting (bold, italic, links) is stripped to plain text — best-effort fidelity.
+- **HTML→DOCX directly** — `htmlToDocxParagraphs` uses `node-html-parser` to walk the rendered HTML DOM and produce `docx` paragraph objects. Turndown is not involved in the DOCX path.
+- **`ContentPullMeta` style** — a custom named paragraph style (`w:val="ContentPullMeta"`) defined in every generated DOCX. Each post begins with one such paragraph containing JSON: `{"slug":..., "type":..., "link":..., "date":..., "modified":...}`. This survives human editing and is the hook for `reimport`.
+- **Page breaks** — `pageBreakBefore: true` on the `ContentPullMeta` paragraph of every post except the first.
+- **Aggregate filename** — uses the site hostname (`example.com.docx`), sanitised for filesystem safety.
+
+## Reimport
+
+`doReimport` orchestrates the round-trip flow:
+
+1. `loadDocxPosts` unzips both DOCXs with `jszip`, parses `word/document.xml` with regex, splits on `ContentPullMeta` paragraphs
+2. `diffParagraphs` runs an LCS diff, coalescing adjacent remove+add into `changed`
+3. `parseWpBlocks` finds leaf-level Gutenberg blocks (those with no nested `<!-- wp:` blocks) by scanning `content.raw`
+4. `spliceBlockText` replaces the inner HTML text of a matched block, preserving the outer tag and its attributes
+5. `initLlmClient` picks Anthropic or OpenAI-compatible based on env vars (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`)
+6. `llmMerge` dispatches to the Anthropic messages API (tool use) or the OpenAI chat completions API (function calling), requesting a structured `{updated, confidence, reasoning}` response
+7. Items with confidence < 90% are collected into `reimport-review.json`
 
 ## Dependencies
 
+- `@anthropic-ai/sdk` ^0.39.0 — Anthropic API client (reimport LLM path)
 - `docx` ^8.5.0 — Word document generation
-- `turndown` ^7.2.0 — HTML to Markdown conversion
+- `jszip` ^3.10.1 — DOCX unzipping for reimport
+- `node-html-parser` ^6.1.0 — HTML→DOCX conversion
+- `openai` ^4.0.0 — OpenAI-compatible API client (reimport LLM path)
+- `turndown` ^7.2.0 — HTML→Markdown conversion (Markdown output only)
 - Node 18+ built-ins: `fetch`, `fs`, `path`, `os`, `http`, `child_process`, `url`
 
 ## SKIP_TYPES
